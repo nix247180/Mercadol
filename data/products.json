@@ -1,0 +1,4 @@
+[
+  {"id":"demo-1","name":"T-shirt coton unisexe","category":"Fashion","price":14.9,"image":"","sold":320,"description":"T-shirt en coton doux.","itemUrl":""},
+  {"id":"demo-2","name":"Écouteurs sans fil Bluetooth","category":"Electronics","price":19.9,"image":"","sold":510,"description":"Écouteurs Bluetooth 5.3.","itemUrl":""}
+]
