@@ -8,7 +8,11 @@ const crypto = require('crypto');
 const app = express();
 const E = process.env;
 const PORT = E.PORT || 3000;
-const DATA_DIR = path.join(__dirname, 'data');
+const ROOT_DIR = __dirname;
+const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
+const INDEX_FILE = path.join(PUBLIC_DIR, 'index.html');
+const DATA_DIR = path.join(ROOT_DIR, 'data');
+fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const F = n => path.join(DATA_DIR, n);
 const rd = (n, d) => { try { return JSON.parse(fs.readFileSync(F(n), 'utf8')); } catch { return d; } };
@@ -19,8 +23,31 @@ app.set('trust proxy', 1);
 app.use(cors({ origin: E.CORS_ORIGIN && E.CORS_ORIGIN !== '*' ? E.CORS_ORIGIN.split(',') : true }));
 app.use(express.json({ limit: '2mb' }));
 
+// Le HTML principal doit toujours être revalidé après un déploiement.
+// Les autres fichiers statiques peuvent être mis en cache brièvement.
+app.use(express.static(PUBLIC_DIR, {
+  index: false,
+  fallthrough: true,
+  etag: true,
+  lastModified: true,
+  setHeaders(res, filePath) {
+    if (path.resolve(filePath) === path.resolve(INDEX_FILE) || /\.html?$/i.test(filePath)) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    } else {
+      res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+    }
+  }
+}));
+
 /* ---------- utilitaires ---------- */
 const hits = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 2 * 3600000;
+  for (const [k, times] of hits) {
+    const fresh = times.filter(t => t > cutoff);
+    if (fresh.length) hits.set(k, fresh); else hits.delete(k);
+  }
+}, 15 * 60000).unref();
 const limit = (key, max, ms) => (req, res, next) => {
   const k = key + req.ip, now = Date.now();
   const a = (hits.get(k) || []).filter(t => now - t < ms);
@@ -51,11 +78,15 @@ let RATES = { USD:1, EUR:.92, GBP:.78, CAD:1.37, AUD:1.5, CHF:.88, BRL:5.5, INR:
 let ratesAt = 0;
 async function refreshRates() {
   if (Date.now() - ratesAt < 12 * 3600000) return;
-  ratesAt = Date.now();
   try {
-    const d = await (await fetch('https://open.er-api.com/v6/latest/USD')).json();
-    if (d.rates) RATES = { ...RATES, ...d.rates };
-  } catch (e) { console.error('taux:', e.message); }
+    const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    if (d.result === 'success' && d.rates) {
+      RATES = { ...RATES, ...d.rates };
+      ratesAt = Date.now();
+    }
+  } catch (e) { console.error('taux (taux de secours conservés):', e.message); }
 }
 const local = (usd, cur) => {
   const v = usd * (RATES[cur] || 1);
@@ -72,9 +103,11 @@ async function cjToken(force) {
   if (!force && cjTok.t && Date.now() < cjTok.exp) return cjTok.t;
   if (!E.CJ_API_KEY) throw new Error('CJ_API_KEY manquante');
   const r = await fetch(`${CJ}/authentication/getAccessToken`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: E.CJ_API_KEY })
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey: E.CJ_API_KEY }), signal: AbortSignal.timeout(12000)
   });
-  const d = await r.json();
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`CJ authentification HTTP ${r.status}`);
   if (!d.data?.accessToken) throw new Error('CJ token refusé : ' + (d.message || r.status));
   cjTok = { t: d.data.accessToken, exp: Date.now() + 14 * 24 * 3600000 }; // valable 180 jours, on renouvelle avant
   await sleep(1100); // CJ : 1 requête par seconde maximum
@@ -87,7 +120,11 @@ function cjGet(pathq) {
     let d;
     for (let k = 0; k < 2; k++) {
       const t = await cjToken(k > 0);
-      d = await (await fetch(CJ + pathq, { headers: { 'CJ-Access-Token': t } })).json();
+      const response = await fetch(CJ + pathq, {
+        headers: { 'CJ-Access-Token': t }, signal: AbortSignal.timeout(18000)
+      });
+      d = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(`CJ catalogue HTTP ${response.status}`);
       if (d.result !== false || !/token|auth/i.test(d.message || '')) break;
     }
     await sleep(1100);
@@ -112,11 +149,13 @@ const COOL = '&orderBy=1&sort=desc&endSellPrice=30'; // les plus listés par les
 
 function mapCJ(list, cat) { // produits bruts (prix en USD, marge incluse)
   return (list || []).map((x, i) => {
-    const base = num(x.nowPrice) || num(x.sellPrice), img = x.bigImage || x.productImage;
-    if (!x.id || !img || base <= 0) return null;
+    const base = num(x.nowPrice) || num(x.sellPrice);
+    const rawImage = x.bigImage || x.productImage || x.productImageSet || '';
+    const img = Array.isArray(rawImage) ? rawImage[0] : String(rawImage).split(',')[0].trim();
+    if (!x.id || !/^https?:\/\//i.test(img) || base <= 0) return null;
     const usd = withProfit(base);
     priceCache.set(String(x.id), usd);
-    return { id: String(x.id), name: x.nameEn || x.productNameEn || x.name || 'Produit', usd, image: String(img).split(',')[0],
+    return { id: String(x.id), name: x.nameEn || x.productNameEn || x.name || 'Produit', usd, image: img,
       itemUrl: cjUrl(x.id), category: cat || '', pop: num(x.listedNum), pos: i };
   }).filter(Boolean);
 }
@@ -154,41 +193,50 @@ function interleave(groups) {
 }
 const present = (items, cur) => items.map(({ usd, pop, pos, px, ...r }) => ({ ...r, price: local(usd, cur), currency: cur, sold: 0, shipping: '' }));
 
-/* ---------- RESOLUTION : on mesure vraiment la taille de chaque image ---------- */
+/* ---------- QUALITE DES IMAGES (verification legere et non bloquante) ---------- */
 const MIN_IMG = Number(E.MIN_IMG_PX || 800);
 const imgCache = new Map();
 function imgSize(b) {
+  if (!Buffer.isBuffer(b) || b.length < 24) return 0;
   if (b[0] === 0xFF && b[1] === 0xD8) {
     let i = 2;
-    while (i < b.length - 9) {
+    while (i + 9 < b.length) {
       if (b[i] !== 0xFF) { i++; continue; }
-      const m = b[i + 1];
-      if (m >= 0xC0 && m <= 0xCF && ![0xC4, 0xC8, 0xCC].includes(m)) return Math.max(b.readUInt16BE(i + 5), b.readUInt16BE(i + 7));
-      i += 2 + b.readUInt16BE(i + 2);
+      const marker = b[i + 1];
+      if (marker >= 0xC0 && marker <= 0xCF && ![0xC4, 0xC8, 0xCC].includes(marker)) {
+        if (i + 8 >= b.length) return 0;
+        return Math.max(b.readUInt16BE(i + 5), b.readUInt16BE(i + 7));
+      }
+      if (i + 3 >= b.length) break;
+      const length = b.readUInt16BE(i + 2);
+      if (length < 2) break;
+      i += 2 + length;
     }
   }
-  if (b[0] === 0x89 && b[1] === 0x50) return Math.max(b.readUInt32BE(16), b.readUInt32BE(20));
+  if (b[0] === 0x89 && b[1] === 0x50 && b.length >= 24) {
+    return Math.max(b.readUInt32BE(16), b.readUInt32BE(20));
+  }
   return 0;
 }
 async function imgPx(url) {
   if (imgCache.has(url)) return imgCache.get(url);
   let px = 0;
   try {
-    const r = await fetch(url, { headers: { Range: 'bytes=0-131071' }, signal: AbortSignal.timeout(4000) });
-    if (r.ok) px = imgSize(Buffer.from(await r.arrayBuffer()));
-  } catch (e) { /* injoignable */ }
-  if (imgCache.size > 5000) imgCache.clear();
+    const r = await fetch(url, { headers: { Range: 'bytes=0-65535' }, signal: AbortSignal.timeout(2500) });
+    if (r.ok || r.status === 206) px = imgSize(Buffer.from(await r.arrayBuffer()));
+  } catch (_) { /* l'image reste utilisable même si son serveur bloque Range */ }
+  if (imgCache.size > 4000) imgCache.clear();
   imgCache.set(url, px);
   return px;
 }
-async function sharpOnly(list, max) { // images nettes d'abord, puis les moins floues
-  const out = [];
-  for (let i = 0; i < list.length; i += 12) {
-    const chunk = list.slice(i, i + 12);
-    const px = await Promise.all(chunk.map(x => imgPx(x.image)));
-    chunk.forEach((x, k) => out.push({ ...x, px: px[k] }));
-  }
-  return out.filter(x => x.px >= MIN_IMG).concat(out.filter(x => x.px < MIN_IMG).sort((a, b) => b.px - a.px)).slice(0, max);
+async function sharpOnly(list, max) {
+  const candidates = list.slice(0, Math.min(list.length, 18));
+  const checks = await Promise.all(candidates.map(async (x) => ({ ...x, px: await imgPx(x.image) })));
+  const good = checks.filter(x => x.px >= MIN_IMG);
+  const unknownOrOther = checks.filter(x => x.px < MIN_IMG).sort((a, b) => b.px - a.px);
+  const ordered = good.concat(unknownOrOther, list.slice(candidates.length));
+  const seen = new Set();
+  return ordered.filter(x => !seen.has(x.id) && seen.add(x.id)).slice(0, max);
 }
 
 /* ---------- CATALOGUE ---------- */
@@ -222,32 +270,60 @@ async function buildHome(cat) {
   homeCache.set(ck, { at: Date.now(), items: out });
   return out;
 }
-const localCatalog = cur => rd('products.json', []).map(x => {
-  const usd = withProfit(num(x.price));
-  cur = cur || 'USD';
-  priceCache.set(String(x.id), usd);
-  return { ...x, id: String(x.id), usd, price: local(usd, cur), currency: cur };
-});
+const localCatalog = cur => rd('products.json', [])
+  .filter(x => x && x.id && (x.image || x.img) && /^https?:\/\//i.test(String(x.image || x.img)))
+  .map(x => {
+    const usd = withProfit(num(x.price));
+    const currency = cur || 'USD';
+    priceCache.set(String(x.id), usd);
+    return { ...x, id: String(x.id), image: x.image || x.img, usd, price: local(usd, currency), currency };
+  });
 
+function catalogLimit(value, fallback = 60, max = 80) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) ? Math.max(1, Math.min(max, n)) : fallback;
+}
+function sendCatalogHeaders(res) {
+  res.setHeader('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
+  res.setHeader('Vary', 'Accept-Encoding');
+}
+function catalogFallback(cat, cur, max) {
+  const stale = homeCache.get(cat || 'All');
+  const items = stale?.items?.length ? stale.items : localCatalog(cur);
+  return present(items.slice(0, max), cur);
+}
 app.get('/api/catalog/home', async (req, res) => {
-  const cur = curOf(req.query);
+  const cur = curOf(req.query), cat = String(req.query.cat || 'All').slice(0, 60) || 'All';
+  const max = catalogLimit(req.query.limit, 60, 80);
+  sendCatalogHeaders(res);
   try {
     await refreshRates();
-    res.json({ ok: true, currency: cur, items: present((await homeItems(req.query.cat)).slice(0, Math.min(Number(req.query.limit || 60), 80)), cur) });
+    const items = await homeItems(cat);
+    res.json({ ok: true, source: 'cj', currency: cur, items: present(items.slice(0, max), cur) });
   } catch (e) {
     console.error('catalog/home:', e.message);
-    res.status(502).json({ error: 'Catalogue indisponible' });
+    const fallback = catalogFallback(cat, cur, max);
+    if (fallback.length) return res.json({ ok: true, source: 'fallback', currency: cur, items: fallback, warning: 'Catalogue CJ temporairement indisponible' });
+    res.status(503).json({ ok: false, error: 'Catalogue temporairement indisponible', currency: cur, items: [] });
   }
 });
 app.get('/api/catalog/search', async (req, res) => {
-  const cur = curOf(req.query);
+  const cur = curOf(req.query), q = String(req.query.q || '').trim().slice(0, 100);
+  const max = catalogLimit(req.query.limit, 48, 60);
+  sendCatalogHeaders(res);
+  if (!q) return res.json({ ok: true, source: 'cj', currency: cur, items: [] });
   try {
     await refreshRates();
-    const q = String(req.query.q || '').slice(0, 100).trim();
-    if (!q) return res.json({ ok: true, currency: cur, items: [] });
-    const items = await sharpOnly(rank(await cjItems(q, '', 40)).slice(0, 60), 60);
-    res.json({ ok: true, currency: cur, items: present(items, cur) });
-  } catch (e) { console.error('search:', e.message); res.status(502).json({ error: 'Recherche indisponible' }); }
+    const items = await sharpOnly(rank(await cjItems(q, '', Math.max(40, max))).slice(0, Math.max(60, max)), max);
+    if (items.length) return res.json({ ok: true, source: 'cj', currency: cur, items: present(items, cur) });
+    const localItems = localCatalog(cur).filter(x => `${x.name || ''} ${x.category || ''}`.toLowerCase().includes(q.toLowerCase())).slice(0, max);
+    return res.json({ ok: true, source: 'fallback', currency: cur, items: localItems, warning: 'Aucun résultat CJ pour cette recherche' });
+  } catch (e) {
+    console.error('catalog/search:', e.message);
+    const localItems = localCatalog(cur).filter(x => `${x.name || ''} ${x.category || ''}`.toLowerCase().includes(q.toLowerCase())).slice(0, max);
+    if (localItems.length) return res.json({ ok: true, source: 'fallback', currency: cur, items: localItems });
+    res.status(503).json({ ok: false, error: 'Recherche temporairement indisponible', currency: cur, items: [] });
+  }
 });
 
 const pickName = v => {
@@ -260,19 +336,28 @@ const imgList = v => {
   if (typeof v === 'string' && v.trim().startsWith('[')) { try { return JSON.parse(v).filter(Boolean); } catch (e) { return []; } }
   return typeof v === 'string' && v ? v.split(',').map(s => s.trim()).filter(Boolean) : [];
 };
+const detailCache = new Map();
 async function cjDetail(id) {
+  const key = String(id);
+  const cached = detailCache.get(key);
+  if (cached && Date.now() - cached.at < 10 * 60000) return cached.value;
   const d = await cjGet(`/product/query?pid=${encodeURIComponent(id)}`), p = d.data;
   if (!p || (!p.bigImage && !p.productImage && !p.productName && !p.productNameEn)) return null;
   const variants = (p.variants || []).map(v => num(v.variantSellPrice)).filter(x => x > 0);
   const base = num(p.nowPrice) || num(p.sellPrice) || (variants.length ? Math.min(...variants) : 0);
   const images = [...imgList(p.bigImage), ...imgList(p.productImage), ...imgList(p.productImageSet)];
-  return {
+  const value = {
     id: String(id), name: pickName(p.productNameEn ?? p.productName), base, images: [...new Set(images)],
     description: String(p.description || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1500)
   };
+  if (detailCache.size > 1000) detailCache.clear();
+  detailCache.set(key, { at: Date.now(), value });
+  return value;
 }
 app.get('/api/catalog/item', async (req, res) => {
-  const id = String(req.query.itemId || req.query.id || ''), cur = curOf(req.query);
+  const id = String(req.query.itemId || req.query.id || '').trim().slice(0, 120), cur = curOf(req.query);
+  if (!id || !/^[\w-]+$/.test(id)) return res.status(400).json({ ok: false, error: 'Identifiant produit invalide' });
+  sendCatalogHeaders(res);
   try {
     await refreshRates();
     const loc = localCatalog(cur).find(x => x.id === id);
@@ -299,7 +384,7 @@ app.get('/api/catalog/similar', async (req, res) => {
     const q = keywords(req.query.name) || String(req.query.q || '').slice(0, 60), id = String(req.query.itemId || '');
     if (!q) return res.json({ ok: true, items: [] });
     const items = (await cjItems(q, String(req.query.category || ''), 30)).filter(i => i.id !== id);
-    const max = Math.min(Number(req.query.limit || 8), 12);
+    const max = catalogLimit(req.query.limit, 8, 12);
     res.json({ ok: true, currency: cur, items: present(await sharpOnly(rank(items).slice(0, 24), max), cur) });
   } catch (e) { console.error('similar:', e.message); res.json({ ok: true, items: [] }); }
 });
@@ -598,9 +683,23 @@ app.post('/api/ai-log', limit('al', 60, 3600000), (req, res) => {
 
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString(),
   config: { cj: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN), campay: !!(E.CAMPAY_TOKEN || E.CAMPAY_USERNAME), campayEnv: CP_HOST.includes('demo') ? 'DEMO' : 'PROD', telegram: !!E.TELEGRAM_BOT_TOKEN, resend: !!E.RESEND_API_KEY } }));
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('*', (req, res, next) => req.path.startsWith('/api/') ? next() : res.sendFile(path.join(__dirname, 'public', 'index.html')));
-app.use((e, req, res, next) => { console.error(e); res.status(500).json({ error: 'Erreur interne' }); });
+// Une route API inconnue doit rester une erreur JSON, jamais renvoyer index.html.
+app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Route API introuvable' }));
+
+// Fallback SPA : uniquement pour les navigations HTML. Les fichiers manquants
+// (images, scripts, feuilles de style) conservent une vraie réponse 404.
+app.get(/.*/, (req, res, next) => {
+  if (!req.accepts('html') || req.method !== 'GET' || path.extname(req.path)) return next();
+  if (!fs.existsSync(INDEX_FILE)) return res.status(500).send('Fichier public/index.html introuvable');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(INDEX_FILE, err => { if (err) next(err); });
+});
+app.use((req, res) => res.status(404).type('text').send('Not found'));
+app.use((e, req, res, next) => {
+  console.error('Erreur serveur:', e);
+  if (res.headersSent) return next(e);
+  res.status(500).json({ ok: false, error: 'Erreur interne' });
+});
 
 if (E.MERCADO_TEST) module.exports = { interleave, rankCool, HOME_MIX, cjItems, homeItems, num, mapCJ, cjDetail, rank, present, keywords, settle, cleanCustomer, cmPhone, toPay, serverTotal, imgSize };
 else app.listen(PORT, '0.0.0.0', () => {
