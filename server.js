@@ -44,7 +44,8 @@ const CUR_BY_COUNTRY = {
   SN:'XOF',CI:'XOF',BJ:'XOF',BF:'XOF',ML:'XOF',NE:'XOF',TG:'XOF',GW:'XOF'
 };
 const NO_DEC = ['XAF','XOF','JPY','KRW','UGX','RWF'];
-const curFor = c => CUR_BY_COUNTRY[String(c || '').toUpperCase()] || 'USD';
+const curFor = c => CUR_BY_COUNTRY[String(c || '').toUpperCase()] || 'USD'; // dollar par défaut
+const curOf = q => { const c = String((q && q.currency) || '').toUpperCase(); return RATES[c] ? c : curFor(q && q.country); }; // la devise demandée par le site gagne
 let RATES = { USD:1, EUR:.92, GBP:.78, CAD:1.37, AUD:1.5, CHF:.88, BRL:5.5, INR:84, ZAR:18, MAD:10, DZD:135, TND:3.1, EGP:48,
   NGN:1500, GHS:15, KES:130, AED:3.67, JPY:150, MXN:18, XAF:603, XOF:603 }; // secours, remplacés par les taux du jour
 let ratesAt = 0;
@@ -75,7 +76,8 @@ async function cjToken(force) {
   });
   const d = await r.json();
   if (!d.data?.accessToken) throw new Error('CJ token refusé : ' + (d.message || r.status));
-  cjTok = { t: d.data.accessToken, exp: Date.now() + 14 * 24 * 3600000 }; // valable 15 jours
+  cjTok = { t: d.data.accessToken, exp: Date.now() + 14 * 24 * 3600000 }; // valable 180 jours, on renouvelle avant
+  await sleep(1100); // CJ : 1 requête par seconde maximum
   return cjTok.t;
 }
 // CJ limite le débit (environ 1 requête/seconde) : on fait la queue
@@ -96,12 +98,17 @@ function cjGet(pathq) {
   return p;
 }
 const cjUrl = id => `https://cjdropshipping.com/product/-p-${id}.html`;
-const CAT_Q = {
-  Electronics: 'electronics gadget', Fashion: 'women fashion', Home: 'home decor', Phones: 'phone case',
-  Computers: 'laptop accessories', Fitness: 'fitness', Sports: 'sports outdoor', Watches: 'watch',
-  Beauty: 'beauty makeup', Automotive: 'car accessories', Toys: 'toys kids'
+const CAT_Q = { // mots-clés « tendance / stylé » envoyés à CJ
+  Electronics: 'bluetooth earbuds', Fashion: 'stylish streetwear', Home: 'led light decor', Phones: 'stylish phone case',
+  Computers: 'gaming rgb', Fitness: 'fitness band', Sports: 'sports outdoor', Watches: 'smart watch',
+  Beauty: 'beauty tools', Automotive: 'car led accessories', Toys: 'fidget toys'
 };
-const HOME_CATS = ['Electronics', 'Fashion', 'Home', 'Beauty', 'Watches'];
+// Accueil = un mélange de toutes les catégories, avec le Bluetooth et les montres en tête
+const HOME_MIX = [['Electronics', 'bluetooth earbuds'], ['Watches', 'smart watch'], ['Fashion', 'stylish streetwear'],
+  ['Electronics', 'bluetooth speaker'], ['Home', 'led light decor'], ['Phones', 'stylish phone case'],
+  ['Computers', 'gaming rgb'], ['Beauty', 'beauty tools'], ['Fitness', 'fitness band']];
+const COOL = '&orderBy=1&sort=desc&endSellPrice=30'; // les plus listés par les vendeurs = les plus populaires, prix max 30 $
+
 
 function mapCJ(list, cat) { // produits bruts (prix en USD, marge incluse)
   return (list || []).map((x, i) => {
@@ -114,10 +121,11 @@ function mapCJ(list, cat) { // produits bruts (prix en USD, marge incluse)
   }).filter(Boolean);
 }
 const kwCache = new Map(); // mot-clé -> {at, items}
-async function cjItems(q, cat, size = 40) {
-  const k = q + '|' + size, hit = kwCache.get(k);
+async function cjItems(q, cat, size = 40, extra = '') {
+  const k = q + '|' + size + '|' + extra, hit = kwCache.get(k);
   if (hit && Date.now() - hit.at < 20 * 60000) return hit.items.map(x => ({ ...x, category: cat || x.category }));
-  const d = await cjGet(`/product/listV2?page=1&size=${size}&keyWord=${encodeURIComponent(q)}`);
+  const d = await cjGet(`/product/listV2?page=1&size=${size}${q ? '&keyWord=' + encodeURIComponent(q) : ''}${extra}`);
+  if (d.result === false || !d.data) console.error('CJ listV2 refusé :', d.code, d.message);
   const list = (d.data?.content || []).flatMap(c => c.productList || []).concat(d.data?.list || []);
   const items = mapCJ(list, cat);
   if (items.length) kwCache.set(k, { at: Date.now(), items });
@@ -129,6 +137,20 @@ function rank(items) {
   const pr = new Map([...items].sort((a, b) => a.usd - b.usd).map((it, i) => [it.id, i / n]));
   return items.map((it, i) => ({ it, s: pr.get(it.id) * .5 + (1 - (it.pop || 0) / maxPop) * .3 + (i / n) * .2 }))
     .sort((a, b) => a.s - b.s).map(o => o.it);
+}
+// Tendance : popularité (50 %), prix (30 %), pertinence (20 %)
+function rankCool(items) {
+  const n = items.length || 1, maxPop = Math.max(1, ...items.map(i => i.pop || 0));
+  const pr = new Map([...items].sort((a, b) => a.usd - b.usd).map((it, i) => [it.id, i / n]));
+  return items.map((it, i) => ({ it, s: (1 - (it.pop || 0) / maxPop) * .5 + pr.get(it.id) * .3 + (i / n) * .2 }))
+    .sort((a, b) => a.s - b.s).map(o => o.it);
+}
+// 1 produit de chaque catégorie à tour de rôle : le mélange reste varié du haut en bas
+function interleave(groups) {
+  const out = [], seen = new Set();
+  for (let i = 0; groups.some(g => i < g.length); i++)
+    for (const g of groups) if (g[i] && !seen.has(g[i].id)) { seen.add(g[i].id); out.push(g[i]); }
+  return out;
 }
 const present = (items, cur) => items.map(({ usd, pop, pos, px, ...r }) => ({ ...r, price: local(usd, cur), currency: cur, sold: 0, shipping: '' }));
 
@@ -171,35 +193,54 @@ async function sharpOnly(list, max) { // images nettes d'abord, puis les moins f
 
 /* ---------- CATALOGUE ---------- */
 const homeCache = new Map();
-async function homeItems(cat) {
+const building = new Map(); // un seul chargement à la fois par catégorie (CJ : 1 requête/seconde)
+function homeItems(cat) {
   const ck = cat || 'All', hit = homeCache.get(ck);
-  if (hit && Date.now() - hit.at < 600000) return hit.items;
-  const one = cat && cat !== 'All', cats = one ? [cat] : HOME_CATS, all = [];
-  for (const c of cats) all.push(...await cjItems(CAT_Q[c] || c, c)); // une par une (limite de débit CJ)
-  const seen = new Set(), items = all.filter(i => !seen.has(i.id) && seen.add(i.id));
-  if (!items.length) throw new Error('catalogue vide');
-  const out = await sharpOnly(rank(items).slice(0, 130), 120);
+  if (hit && Date.now() - hit.at < 600000) return Promise.resolve(hit.items);
+  if (building.has(ck)) return building.get(ck);
+  const p = buildHome(cat).finally(() => building.delete(ck));
+  building.set(ck, p);
+  return p;
+}
+async function buildHome(cat) {
+  const one = cat && cat !== 'All', ck = cat || 'All';
+  let items;
+  if (one) {
+    items = await cjItems(CAT_Q[cat] || cat, cat, 60, COOL);
+    if (!items.length) items = await cjItems(CAT_Q[cat] || cat, cat, 60);
+    items = rankCool(items);
+  } else {
+    const groups = [];
+    for (const [c, q] of HOME_MIX) {
+      try { const g = await cjItems(q, c, 24, COOL); if (g.length) groups.push(rankCool(g).slice(0, 10)); }
+      catch (e) { if (/token|CJ_API_KEY/i.test(e.message)) throw e; console.error('accueil', q, e.message); }
+    }
+    items = interleave(groups);
+  }
+  if (!items.length) throw new Error('catalogue vide (voir « CJ listV2 refusé » plus haut dans les logs)');
+  const out = await sharpOnly(items.slice(0, 90), 80);
   homeCache.set(ck, { at: Date.now(), items: out });
   return out;
 }
-const localCatalog = country => rd('products.json', []).map(x => {
-  const usd = withProfit(num(x.price)), cur = curFor(country);
+const localCatalog = cur => rd('products.json', []).map(x => {
+  const usd = withProfit(num(x.price));
+  cur = cur || 'USD';
   priceCache.set(String(x.id), usd);
   return { ...x, id: String(x.id), usd, price: local(usd, cur), currency: cur };
 });
 
 app.get('/api/catalog/home', async (req, res) => {
-  const country = req.query.country || 'CM', cur = curFor(country);
+  const cur = curOf(req.query);
   try {
     await refreshRates();
-    res.json({ ok: true, currency: cur, items: present((await homeItems(req.query.cat)).slice(0, Math.min(Number(req.query.limit || 60), 120)), cur) });
+    res.json({ ok: true, currency: cur, items: present((await homeItems(req.query.cat)).slice(0, Math.min(Number(req.query.limit || 60), 80)), cur) });
   } catch (e) {
     console.error('catalog/home:', e.message);
-    res.json({ ok: true, currency: cur, items: localCatalog(country).map(({ usd, ...r }) => r) });
+    res.status(502).json({ error: 'Catalogue indisponible' });
   }
 });
 app.get('/api/catalog/search', async (req, res) => {
-  const cur = curFor(req.query.country || 'CM');
+  const cur = curOf(req.query);
   try {
     await refreshRates();
     const q = String(req.query.q || '').slice(0, 100).trim();
@@ -221,20 +262,20 @@ const imgList = v => {
 };
 async function cjDetail(id) {
   const d = await cjGet(`/product/query?pid=${encodeURIComponent(id)}`), p = d.data;
-  if (!p || (!p.productImage && !p.productName && !p.productNameEn)) return null;
+  if (!p || (!p.bigImage && !p.productImage && !p.productName && !p.productNameEn)) return null;
   const variants = (p.variants || []).map(v => num(v.variantSellPrice)).filter(x => x > 0);
   const base = num(p.nowPrice) || num(p.sellPrice) || (variants.length ? Math.min(...variants) : 0);
-  const images = [...imgList(p.productImage), ...imgList(p.productImageSet)];
+  const images = [...imgList(p.bigImage), ...imgList(p.productImage), ...imgList(p.productImageSet)];
   return {
     id: String(id), name: pickName(p.productNameEn ?? p.productName), base, images: [...new Set(images)],
     description: String(p.description || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1500)
   };
 }
 app.get('/api/catalog/item', async (req, res) => {
-  const id = String(req.query.itemId || req.query.id || ''), cur = curFor(req.query.country || 'CM');
+  const id = String(req.query.itemId || req.query.id || ''), cur = curOf(req.query);
   try {
     await refreshRates();
-    const loc = localCatalog(req.query.country).find(x => x.id === id);
+    const loc = localCatalog(cur).find(x => x.id === id);
     if (loc) { const { usd, ...r } = loc; return res.json({ ok: true, ...r, img: r.image, item: r }); }
     const d = await cjDetail(id);
     if (!d) return res.status(404).json({ error: 'Produit introuvable' });
@@ -252,7 +293,7 @@ const STOP = new Set(['the','and','for','with','new','neuf','pour','avec','les',
 const keywords = name => String(name || '').toLowerCase().replace(/[^\p{L}\p{N} ]/gu, ' ').split(/\s+/)
   .filter(w => w.length > 2 && !STOP.has(w) && !/\d/.test(w)).slice(0, 3).join(' ');
 app.get('/api/catalog/similar', async (req, res) => {
-  const cur = curFor(req.query.country || 'CM');
+  const cur = curOf(req.query);
   try {
     await refreshRates();
     const q = keywords(req.query.name) || String(req.query.q || '').slice(0, 60), id = String(req.query.itemId || '');
@@ -261,6 +302,17 @@ app.get('/api/catalog/similar', async (req, res) => {
     const max = Math.min(Number(req.query.limit || 8), 12);
     res.json({ ok: true, currency: cur, items: present(await sharpOnly(rank(items).slice(0, 24), max), cur) });
   } catch (e) { console.error('similar:', e.message); res.json({ ok: true, items: [] }); }
+});
+
+// Diagnostic : ouvrez /api/cj-status dans le navigateur pour voir si la clé CJ fonctionne (aucun secret affiché)
+app.get('/api/cj-status', limit('cs', 8, 3600000), async (req, res) => {
+  const out = { cleCJ: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN) };
+  try {
+    await cjToken(true); out.jeton = 'ok';
+    const d = await cjGet('/product/listV2?page=1&size=3&keyWord=hoodie');
+    out.liste = { code: d.code, result: d.result, message: d.message, produits: (d.data?.content || []).flatMap(c => c.productList || []).length };
+  } catch (e) { out.erreur = String(e.message).slice(0, 200); }
+  res.json(out);
 });
 
 // CJ n'a pas de recherche par photo : le site masque le bouton appareil photo
@@ -550,7 +602,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res, next) => req.path.startsWith('/api/') ? next() : res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.use((e, req, res, next) => { console.error(e); res.status(500).json({ error: 'Erreur interne' }); });
 
-if (E.MERCADO_TEST) module.exports = { num, mapCJ, cjDetail, rank, present, keywords, settle, cleanCustomer, cmPhone, toPay, serverTotal, imgSize };
+if (E.MERCADO_TEST) module.exports = { interleave, rankCool, HOME_MIX, cjItems, homeItems, num, mapCJ, cjDetail, rank, present, keywords, settle, cleanCustomer, cmPhone, toPay, serverTotal, imgSize };
 else app.listen(PORT, '0.0.0.0', () => {
   console.log(`MERCADO port ${PORT} | marge ${PROFIT_USD} USD | CamPay ${CP_HOST.includes('demo') ? 'DEMO' : 'PROD'}`);
   setTimeout(() => homeItems('All').catch(e => console.error('préchargement:', e.message)), 4000); // accueil prêt avant la 1re visite
