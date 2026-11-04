@@ -2,32 +2,29 @@ PORT=10000
 CORS_ORIGIN=*
 PUBLIC_BASE_URL=https://VOTRE-SERVICE.onrender.com
 
-# --- Produits : CJ Dropshipping (developers.cjdropshipping.com > API Key) ---
+# CJ DROPSHIPPING
 CJ_API_KEY=
 
-# --- Paiement : CamPay (campay.net) ---
-# DEMO = tests (demo.campay.net) ; PROD = argent réel (campay.net)
+# CAMPAY
+# DEMO = tests ; PROD = paiements réels
 CAMPAY_ENV=DEMO
-# Jeton permanent (rubrique APP KEYS de votre application CamPay)...
 CAMPAY_TOKEN=
-# ...ou bien identifiant + mot de passe de l'application
 CAMPAY_USERNAME=
 CAMPAY_PASSWORD=
 
-# --- Marge cachée en dollars, par produit ---
+# MARGE PAR PRODUIT
 PROFIT_USD=10
 
-# --- Notifications ---
+# NOTIFICATIONS TELEGRAM
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
-RESEND_API_KEY=
-RESEND_FROM="MERCADO <onboarding@resend.dev>"
 
-# --- Optionnel ---
+# OPTIONS
 ADMIN_KEY=
 REMINDER_DELAY_HOURS=24
 MIN_IMG_PX=800
+
+# API OPTIONNELLES
 ANTHROPIC_API_KEY=
 DEEPL_API_KEY=
 GOOGLE_TRANSLATE_API_KEY=
-# ANTHROPIC_MODEL=claude-sonnet-5-5
