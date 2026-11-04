@@ -1,0 +1,17 @@
+MERCADO STATIC VERIFICATION REPORT
+Date: 2026-11-04
+
+PASS 1 — Backend JavaScript syntax: node --check server.js
+PASS 2 — Frontend inline JavaScript syntax: extracted script passed node --check
+PASS 3 — HTML parser: parsed; 0 duplicate IDs
+PASS 4 — JSON files: package.json and data/products.json parse successfully
+PASS 5 — Package/archive integrity: required files present; ZIP test passed
+
+NOT TESTED LIVE:
+- CJ credentials/API responses and actual product variant shape
+- CamPay DEMO/PROD transaction and webhook behavior
+- Telegram delivery to the owner's chat
+- Render environment variables and deployment
+- Full end-to-end browser checkout on a real device
+
+Important: CJ remains an internal supplier integration. Public branding is MERCADO. CamPay payment is hosted by CamPay. Automatic supplier order placement at CJ after payment is not implemented in this version.
