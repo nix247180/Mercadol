@@ -72,7 +72,7 @@ const CUR_BY_COUNTRY = {
 };
 const NO_DEC = ['XAF','XOF','JPY','KRW','UGX','RWF'];
 const curFor = c => CUR_BY_COUNTRY[String(c || '').toUpperCase()] || 'USD'; // dollar par défaut
-const curOf = q => { const c = String((q && q.currency) || '').toUpperCase(); return RATES[c] ? c : curFor(q && q.country); }; // la devise demandée par le site gagne
+const curOf = q => 'USD'; // MERCADO affiche tous les prix en dollars US
 let RATES = { USD:1, EUR:.92, GBP:.78, CAD:1.37, AUD:1.5, CHF:.88, BRL:5.5, INR:84, ZAR:18, MAD:10, DZD:135, TND:3.1, EGP:48,
   NGN:1500, GHS:15, KES:130, AED:3.67, JPY:150, MXN:18, XAF:603, XOF:603 }; // secours, remplacés par les taux du jour
 let ratesAt = 0;
@@ -88,10 +88,7 @@ async function refreshRates() {
     }
   } catch (e) { console.error('taux (taux de secours conservés):', e.message); }
 }
-const local = (usd, cur) => {
-  const v = usd * (RATES[cur] || 1);
-  return NO_DEC.includes(cur) ? Math.round(v / 5) * 5 : Math.round(v * 100) / 100;
-};
+const local = (usd, cur) => Math.round(Number(usd || 0) * 100) / 100; // prix affiché en USD
 const priceCache = new Map(); // id -> prix USD (marge incluse)
 const withProfit = base => Math.round((base + PROFIT_USD) * 100) / 100;
 
@@ -144,7 +141,9 @@ const CAT_Q = { // mots-clés « tendance / stylé » envoyés à CJ
 const HOME_MIX = [['Electronics', 'bluetooth earbuds'], ['Watches', 'smart watch'], ['Fashion', 'stylish streetwear'],
   ['Electronics', 'bluetooth speaker'], ['Home', 'led light decor'], ['Phones', 'stylish phone case'],
   ['Computers', 'gaming rgb'], ['Beauty', 'beauty tools'], ['Fitness', 'fitness band']];
-const COOL = '&orderBy=1&sort=desc&endSellPrice=30'; // les plus listés par les vendeurs = les plus populaires, prix max 30 $
+const CJ_MIN_USD = 1;
+const CJ_MAX_USD = 15;
+const COOL = `&orderBy=1&sort=asc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // CJ : produits fournisseurs entre 1 et 15 USD, du moins cher au plus cher
 
 
 function mapCJ(list, cat) { // produits bruts (prix en USD, marge incluse)
@@ -152,11 +151,11 @@ function mapCJ(list, cat) { // produits bruts (prix en USD, marge incluse)
     const base = num(x.nowPrice) || num(x.sellPrice);
     const rawImage = x.bigImage || x.productImage || x.productImageSet || '';
     const img = Array.isArray(rawImage) ? rawImage[0] : String(rawImage).split(',')[0].trim();
-    if (!x.id || !/^https?:\/\//i.test(img) || base <= 0) return null;
+    if (!x.id || !/^https?:\/\//i.test(img) || base < CJ_MIN_USD || base > CJ_MAX_USD) return null;
     const usd = withProfit(base);
     priceCache.set(String(x.id), usd);
-    return { id: String(x.id), name: x.nameEn || x.productNameEn || x.name || 'Produit', usd, image: img,
-      itemUrl: cjUrl(x.id), category: cat || '', pop: num(x.listedNum), pos: i };
+    return { id: String(x.id), name: x.nameEn || x.productNameEn || x.name || 'Produit', usd, supplierBase: base, image: img,
+      itemUrl: cjUrl(x.id), category: cat || '', pop: num(x.listedNum || x.listedCount || x.salesVolume), pos: i };
   }).filter(Boolean);
 }
 const kwCache = new Map(); // mot-clé -> {at, items}
@@ -180,8 +179,9 @@ function rank(items) {
 // Tendance : popularité (50 %), prix (30 %), pertinence (20 %)
 function rankCool(items) {
   const n = items.length || 1, maxPop = Math.max(1, ...items.map(i => i.pop || 0));
-  const pr = new Map([...items].sort((a, b) => a.usd - b.usd).map((it, i) => [it.id, i / n]));
-  return items.map((it, i) => ({ it, s: (1 - (it.pop || 0) / maxPop) * .5 + pr.get(it.id) * .3 + (i / n) * .2 }))
+  const pr = new Map([...items].sort((a, b) => a.supplierBase - b.supplierBase).map((it, i) => [it.id, i / n]));
+  // 45 % prix bas, 35 % popularité réelle, 20 % pertinence d'origine CJ
+  return items.map((it, i) => ({ it, s: pr.get(it.id) * .45 + (1 - (it.pop || 0) / maxPop) * .35 + (i / n) * .20 }))
     .sort((a, b) => a.s - b.s).map(o => o.it);
 }
 // 1 produit de chaque catégorie à tour de rôle : le mélange reste varié du haut en bas
@@ -191,7 +191,7 @@ function interleave(groups) {
     for (const g of groups) if (g[i] && !seen.has(g[i].id)) { seen.add(g[i].id); out.push(g[i]); }
   return out;
 }
-const present = (items, cur) => items.map(({ usd, pop, pos, px, ...r }) => ({ ...r, price: local(usd, cur), currency: cur, sold: 0, shipping: '' }));
+const present = (items, cur) => items.map(({ usd, pop, pos, px, supplierBase, ...r }) => ({ ...r, price: local(usd, cur), currency: cur, sold: 0, shipping: '' }));
 
 /* ---------- QUALITE DES IMAGES (verification legere et non bloquante) ---------- */
 const MIN_IMG = Number(E.MIN_IMG_PX || 800);
@@ -274,10 +274,10 @@ const localCatalog = cur => rd('products.json', [])
   .filter(x => x && x.id && (x.image || x.img) && /^https?:\/\//i.test(String(x.image || x.img)))
   .map(x => {
     const usd = withProfit(num(x.price));
-    const currency = cur || 'USD';
+    const currency = 'USD';
     priceCache.set(String(x.id), usd);
     return { ...x, id: String(x.id), image: x.image || x.img, usd, price: local(usd, currency), currency };
-  });
+  }).sort((a, b) => a.usd - b.usd);
 
 function catalogLimit(value, fallback = 60, max = 80) {
   const n = Number.parseInt(value, 10);
@@ -314,7 +314,8 @@ app.get('/api/catalog/search', async (req, res) => {
   if (!q) return res.json({ ok: true, source: 'cj', currency: cur, items: [] });
   try {
     await refreshRates();
-    const items = await sharpOnly(rank(await cjItems(q, '', Math.max(40, max))).slice(0, Math.max(60, max)), max);
+    const ranked = rankCool(await cjItems(q, '', Math.max(60, max), COOL));
+    const items = (await sharpOnly(ranked, Math.max(60, max))).slice(0, max);
     if (items.length) return res.json({ ok: true, source: 'cj', currency: cur, items: present(items, cur) });
     const localItems = localCatalog(cur).filter(x => `${x.name || ''} ${x.category || ''}`.toLowerCase().includes(q.toLowerCase())).slice(0, max);
     return res.json({ ok: true, source: 'fallback', currency: cur, items: localItems, warning: 'Aucun résultat CJ pour cette recherche' });
@@ -343,11 +344,42 @@ async function cjDetail(id) {
   if (cached && Date.now() - cached.at < 10 * 60000) return cached.value;
   const d = await cjGet(`/product/query?pid=${encodeURIComponent(id)}`), p = d.data;
   if (!p || (!p.bigImage && !p.productImage && !p.productName && !p.productNameEn)) return null;
-  const variants = (p.variants || []).map(v => num(v.variantSellPrice)).filter(x => x > 0);
-  const base = num(p.nowPrice) || num(p.sellPrice) || (variants.length ? Math.min(...variants) : 0);
+  const rawVariants = Array.isArray(p.variants) ? p.variants : [];
+  const variants = rawVariants.map((v, index) => {
+    // CJ peut exposer les attributs dans variantName, variantKey ou variantProperty.
+    const rawAttrs = [v.variantName, v.variantKey, v.variantProperty, v.name]
+      .filter(Boolean).map(x => typeof x === 'string' ? x : JSON.stringify(x));
+    const attrs = rawAttrs.join(' / ');
+    const parts = attrs.split(/[,;|/]+/).map(x => x.trim()).filter(Boolean);
+    const structured = {};
+    for (const source of [v.variantProperty, v.variantName, v.variantKey]) {
+      let obj = source && typeof source === 'object' ? source : null;
+      if (!obj && typeof source === 'string' && /^\s*\{/.test(source)) { try { obj = JSON.parse(source); } catch (_) {} }
+      if (obj && typeof obj === 'object') Object.assign(structured, obj);
+    }
+    const sizeField = Object.entries(structured).find(([k]) => /size|taille|尺码/i.test(k));
+    const colorField = Object.entries(structured).find(([k]) => /colou?r|couleur/i.test(k));
+    const sizeToken = '(XXXS|XXS|XXL|XXXL|XXS|XS|S|M|L|XL|[0-9]{1,3}(?:\\.[0-9])?)';
+    const sizeMatch = attrs.match(new RegExp('(?:size|taille|尺码)\\s*[:：=\\-]?\\s*' + sizeToken, 'i'))
+      || attrs.match(new RegExp('(?:^|[\\s,:;|/_-])' + sizeToken + '(?:$|[\\s,:;|/_-])', 'i'))
+      || parts.map(x => x.match(new RegExp('^(?:EU|US|UK)?\\s*' + sizeToken + '$', 'i'))).find(Boolean);
+    const size = String(sizeField?.[1] ?? (sizeMatch ? sizeMatch[1] : '')).trim();
+    const colorNames = ['black','white','red','blue','navy','green','pink','purple','violet','yellow','orange','brown','beige','grey','gray','silver','gold','khaki','wine','burgundy','multicolor','multi-color','rose','noir','blanc','rouge','bleu','vert','rose','violet','jaune','orange','marron','beige','gris'];
+    const colorMatch = attrs.match(/(?:color|colour|couleur)\s*[:：=\-]?\s*([a-zA-ZÀ-ÿ][a-zA-ZÀ-ÿ -]{1,24})/i);
+    let color = String(colorField?.[1] ?? (colorMatch ? colorMatch[1].split(/[;,|/]/)[0].trim() : '')).trim();
+    if (!color) {
+      const lower = attrs.toLowerCase();
+      color = colorNames.find(c => new RegExp('(?:^|[\\s,:;|/\\-_])' + c.replace('-', '[\\s-]?') + '(?:$|[\\s,:;|/\\-_])', 'i').test(lower)) || '';
+    }
+    const basePrice = num(v.variantSellPrice) || num(v.sellPrice) || num(v.variantPrice);
+    const variantId = String(v.vid || v.variantId || v.variant_id || v.id || '');
+    return { variantId, label: [size ? `Size ${size}` : '', color ? `Color ${color}` : '', (!size && !color) ? (attrs || `Option ${index+1}`) : ''].filter(Boolean).join(' — '), size, color, base: basePrice, stock: (v.variantStock != null || v.stock != null || v.inventoryNum != null) ? num(v.variantStock ?? v.stock ?? v.inventoryNum) : null, sku: String(v.variantSku || v.sku || '').slice(0,80) };
+  }).filter(v => v.variantId && v.base > 0);
+  const validPrices = variants.map(v => v.base);
+  const base = num(p.nowPrice) || num(p.sellPrice) || (validPrices.length ? Math.min(...validPrices) : 0);
   const images = [...imgList(p.bigImage), ...imgList(p.productImage), ...imgList(p.productImageSet)];
   const value = {
-    id: String(id), name: pickName(p.productNameEn ?? p.productName), base, images: [...new Set(images)],
+    id: String(id), name: pickName(p.productNameEn ?? p.productName), base, variants, images: [...new Set(images)],
     description: String(p.description || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1500)
   };
   if (detailCache.size > 1000) detailCache.clear();
@@ -368,7 +400,7 @@ app.get('/api/catalog/item', async (req, res) => {
     if (usd == null) return res.status(404).json({ error: 'Prix indisponible' });
     priceCache.set(id, usd);
     const item = { id, name: d.name, price: local(usd, cur), currency: cur, image: d.images[0] || '', img: d.images[0] || '',
-      images: d.images, description: d.description, itemUrl: cjUrl(id) };
+      images: d.images, description: d.description, itemUrl: cjUrl(id), variants: (d.variants || []).map(v => ({ variantId:v.variantId, label:v.label, size:v.size, color:v.color, stock:v.stock, price:withProfit(v.base), currency:'USD' })) };
     res.json({ ok: true, ...item, item });
   } catch (e) { console.error('item:', e.message); res.status(502).json({ error: 'Détail indisponible' }); }
 });
@@ -383,9 +415,9 @@ app.get('/api/catalog/similar', async (req, res) => {
     await refreshRates();
     const q = keywords(req.query.name) || String(req.query.q || '').slice(0, 60), id = String(req.query.itemId || '');
     if (!q) return res.json({ ok: true, items: [] });
-    const items = (await cjItems(q, String(req.query.category || ''), 30)).filter(i => i.id !== id);
+    const items = rankCool((await cjItems(q, String(req.query.category || ''), 30, COOL)).filter(i => i.id !== id));
     const max = catalogLimit(req.query.limit, 8, 12);
-    res.json({ ok: true, currency: cur, items: present(await sharpOnly(rank(items).slice(0, 24), max), cur) });
+    res.json({ ok: true, currency: cur, items: present(await sharpOnly(items, max), cur) });
   } catch (e) { console.error('similar:', e.message); res.json({ ok: true, items: [] }); }
 });
 
@@ -440,16 +472,7 @@ app.post('/api/translate', limit('tr', 30, 3600000), async (req, res) => {
   } catch (e) { res.status(503).json({ error: 'Traduction indisponible' }); }
 });
 
-/* ---------- EMAIL (Resend) + TELEGRAM ---------- */
-async function sendMail(to, subject, text, html) {
-  if (!E.RESEND_API_KEY) return false;
-  const r = await fetch('https://api.resend.com/emails', {
-    method: 'POST', headers: { Authorization: `Bearer ${E.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: E.RESEND_FROM || 'MERCADO <onboarding@resend.dev>', to: [to], subject, text, ...(html ? { html } : {}) })
-  });
-  if (!r.ok) console.error('Resend:', r.status, await r.text());
-  return r.ok;
-}
+/* ---------- TELEGRAM ORDER NOTIFICATIONS ---------- */
 async function telegram(text) {
   if (!E.TELEGRAM_BOT_TOKEN || !E.TELEGRAM_CHAT_ID) return;
   try {
@@ -461,11 +484,12 @@ async function telegram(text) {
 }
 
 /* ---------- COMMANDES ---------- */
-async function refreshPrice(id) {
+async function refreshPrice(id, variantId = '') {
   const loc = localCatalog().find(x => x.id === String(id));
-  if (loc) return loc.usd;
+  if (loc && !variantId) return loc.usd;
   try {
     const d = await cjDetail(id);
+    if (d && variantId) { const v = (d.variants || []).find(x => x.variantId === String(variantId)); return v ? withProfit(v.base) : null; }
     if (d && d.base > 0) { const p = withProfit(d.base); priceCache.set(String(id), p); return p; }
   } catch (e) { console.error('refreshPrice:', e.message); }
   return null;
@@ -474,8 +498,19 @@ async function serverTotal(items) { // total USD marge incluse : le prix vient d
   let t = 0;
   for (const i of items || []) {
     const id = String(i.id);
-    let p = priceCache.get(id);
-    if (p == null) p = await refreshPrice(id);
+    if (i.requiresVariant && !i.variantId) return null;
+    let p;
+    if (i.variantId) {
+      p = await refreshPrice(id, i.variantId);
+    } else {
+      // Si CJ indique plusieurs variantes, on exige que le client en choisisse une.
+      try {
+        const detail = await cjDetail(id);
+        if (detail && (detail.variants || []).length > 1) return null;
+        p = detail && detail.base > 0 ? withProfit(detail.base) : priceCache.get(id);
+      } catch (_) { p = priceCache.get(id); }
+      if (p == null) p = await refreshPrice(id, '');
+    }
     if (p == null) return null;
     t += p * Math.max(1, Math.min(99, Number(i.qty) || 1));
   }
@@ -490,17 +525,20 @@ function orderText(o, head) {
   return `${head} ${o.orderId}\n👤 ${c.name} | ${c.phone}${c.phone2 ? ' / ' + c.phone2 : ''} | ${c.email}\n` +
     `📍 ${c.address}${c.quarter ? ', ' + c.quarter : ''}${c.landmark ? ' (près de ' + c.landmark + ')' : ''}\n${c.city}, ${c.region} ${c.zip} ${c.country}\n` +
     (c.notes ? `📝 ${c.notes}\n` : '') +
-    o.items.map(i => `• ${i.name} x${i.qty}\n  CJ pid: ${i.id}\n  ${i.itemUrl}`).join('\n') +
+    o.items.map(i => `• ${i.name}${i.variantName ? ' — ' + i.variantName : ''} x${i.qty}\n  CJ pid: ${i.id}${i.variantId ? ' | variant: ' + i.variantId : ''}\n  ${i.itemUrl}`).join('\n') +
     `\n💰 Total $${o.total.toFixed(2)} (dont marge $${o.profitUsd.toFixed(2)})`;
 }
 app.post('/api/order', limit('od', 30, 3600000), async (req, res) => {
   try {
     const b = req.body || {}, pay = rd('payments.json', {})[cleanId(b.orderId)];
     await refreshRates();
-    const items = (b.items || []).slice(0, 50).map(i => ({ id: String(i.id), name: String(i.name || '').slice(0, 200), qty: Math.max(1, Math.min(99, Number(i.qty) || 1)), itemUrl: cjUrl(i.id) }));
+    const items = (b.items || []).slice(0, 50).map(i => ({ id: String(i.id), name: String(i.name || '').slice(0, 200), qty: Math.max(1, Math.min(99, Number(i.qty) || 1)), requiresVariant: !!i.requiresVariant, variantId: String(i.variantId || '').slice(0,100), variantName: String(i.variantName || '').slice(0,120), itemUrl: cjUrl(i.id) }));
+    if (!items.length) return res.status(400).json({ ok:false, error:'Le panier est vide.' });
+    const verifiedTotal = await serverTotal(items);
+    if (!verifiedTotal) return res.status(400).json({ ok:false, error:'Choisissez une taille ou une variante valide pour chaque produit avant de commander.' });
     const order = {
       orderId: cleanId(b.orderId), customer: cleanCustomer(b.customer), items,
-      total: (await serverTotal(items)) ?? 0, profitUsd: PROFIT_USD * items.reduce((n, i) => n + i.qty, 0),
+      total: verifiedTotal, profitUsd: PROFIT_USD * items.reduce((n, i) => n + i.qty, 0),
       status: pay?.paid ? 'paid' : 'pending', createdAt: new Date().toISOString()
     };
     const orders = rd('orders.json', []);
@@ -534,7 +572,7 @@ const cmPhone = p => { const d = String(p || '').replace(/\D/g, ''); return /^23
 app.post('/api/payment/campay', limit('cp', 20, 3600000), async (req, res) => {
   try {
     const o = req.body || {}, c = cleanCustomer(o.customer), orderId = cleanId(o.orderId);
-    if (!okEmail(c.email)) return res.status(400).json({ error: 'Email obligatoire' });
+    if (!okEmail(c.email)) return res.status(400).json({ error: 'Une adresse email valide est obligatoire pour le suivi de commande' });
     if (!c.name || !c.phone || !c.address || !c.city) return res.status(400).json({ error: 'Nom, téléphone, adresse et ville obligatoires' });
     await refreshRates();
     const usd = await serverTotal(o.items);
@@ -572,7 +610,6 @@ async function settle(orderId) {
   if (o && o.status !== 'paid') {
     o.status = 'paid'; o.paidAt = p.paidAt; wr('orders.json', orders);
     telegram(orderText(o, '✅ PAYÉ ' + p.amount + ' XAF —'));
-    if (okEmail(o.customer.email)) sendMail(o.customer.email, `Commande ${orderId} confirmée`, `Merci pour votre commande MERCADO ${orderId}. Paiement reçu, nous préparons votre livraison.`);
   }
   return true;
 }
@@ -682,7 +719,7 @@ app.post('/api/ai-log', limit('al', 60, 3600000), (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString(),
-  config: { cj: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN), campay: !!(E.CAMPAY_TOKEN || E.CAMPAY_USERNAME), campayEnv: CP_HOST.includes('demo') ? 'DEMO' : 'PROD', telegram: !!E.TELEGRAM_BOT_TOKEN, resend: !!E.RESEND_API_KEY } }));
+  config: { cj: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN), campay: !!(E.CAMPAY_TOKEN || E.CAMPAY_USERNAME), campayEnv: CP_HOST.includes('demo') ? 'DEMO' : 'PROD', telegram: !!E.TELEGRAM_BOT_TOKEN } }));
 // Une route API inconnue doit rester une erreur JSON, jamais renvoyer index.html.
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Route API introuvable' }));
 
