@@ -143,7 +143,8 @@ const HOME_MIX = [['Electronics', 'bluetooth earbuds'], ['Watches', 'smart watch
   ['Computers', 'gaming rgb'], ['Beauty', 'beauty tools'], ['Fitness', 'fitness band']];
 const CJ_MIN_USD = 1;
 const CJ_MAX_USD = 15;
-const COOL = `&orderBy=1&sort=asc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // CJ : produits fournisseurs entre 1 et 15 USD, du moins cher au plus cher
+const COOL = `&orderBy=1&sort=asc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // sélection économique de la page d'accueil
+const SEARCH_SORT = '&orderBy=1&sort=desc'; // recherche libre : aucun plafond de prix
 
 
 function mapCJ(list, cat) { // produits bruts (prix en USD, marge incluse)
@@ -151,7 +152,7 @@ function mapCJ(list, cat) { // produits bruts (prix en USD, marge incluse)
     const base = num(x.nowPrice) || num(x.sellPrice);
     const rawImage = x.bigImage || x.productImage || x.productImageSet || '';
     const img = Array.isArray(rawImage) ? rawImage[0] : String(rawImage).split(',')[0].trim();
-    if (!x.id || !/^https?:\/\//i.test(img) || base < CJ_MIN_USD || base > CJ_MAX_USD) return null;
+    if (!x.id || !/^https?:\/\//i.test(img) || base <= 0) return null;
     const usd = withProfit(base);
     priceCache.set(String(x.id), usd);
     return { id: String(x.id), name: x.nameEn || x.productNameEn || x.name || 'Produit', usd, supplierBase: base, image: img,
@@ -159,10 +160,10 @@ function mapCJ(list, cat) { // produits bruts (prix en USD, marge incluse)
   }).filter(Boolean);
 }
 const kwCache = new Map(); // mot-clé -> {at, items}
-async function cjItems(q, cat, size = 40, extra = '') {
-  const k = q + '|' + size + '|' + extra, hit = kwCache.get(k);
+async function cjItems(q, cat, size = 40, extra = '', page = 1) {
+  const k = q + '|' + size + '|' + extra + '|page=' + page, hit = kwCache.get(k);
   if (hit && Date.now() - hit.at < 20 * 60000) return hit.items.map(x => ({ ...x, category: cat || x.category }));
-  const d = await cjGet(`/product/listV2?page=1&size=${size}${q ? '&keyWord=' + encodeURIComponent(q) : ''}${extra}`);
+  const d = await cjGet(`/product/listV2?page=${Math.max(1, Number(page) || 1)}&size=${Math.max(1, Math.min(100, Number(size) || 60))}${q ? '&keyWord=' + encodeURIComponent(q) : ''}${extra}`);
   if (d.result === false || !d.data) console.error('CJ listV2 refusé :', d.code, d.message);
   const list = (d.data?.content || []).flatMap(c => c.productList || []).concat(d.data?.list || []);
   const items = mapCJ(list, cat);
@@ -309,21 +310,26 @@ app.get('/api/catalog/home', async (req, res) => {
 });
 app.get('/api/catalog/search', async (req, res) => {
   const cur = curOf(req.query), q = String(req.query.q || '').trim().slice(0, 100);
-  const max = catalogLimit(req.query.limit, 48, 60);
+  const max = catalogLimit(req.query.limit, 60, 100);
+  const page = Math.max(1, Math.min(50, Number.parseInt(req.query.page, 10) || 1));
   sendCatalogHeaders(res);
-  if (!q) return res.json({ ok: true, source: 'cj', currency: cur, items: [] });
+  if (!q) return res.json({ ok: true, source: 'cj', currency: cur, page, items: [], hasMore: false });
   try {
     await refreshRates();
-    const ranked = rankCool(await cjItems(q, '', Math.max(60, max), COOL));
-    const items = (await sharpOnly(ranked, Math.max(60, max))).slice(0, max);
-    if (items.length) return res.json({ ok: true, source: 'cj', currency: cur, items: present(items, cur) });
-    const localItems = localCatalog(cur).filter(x => `${x.name || ''} ${x.category || ''}`.toLowerCase().includes(q.toLowerCase())).slice(0, max);
-    return res.json({ ok: true, source: 'fallback', currency: cur, items: localItems, warning: 'Aucun résultat CJ pour cette recherche' });
+    // Chaque page correspond à une vraie page du catalogue CJ, sans plafond de prix.
+    const raw = await cjItems(q, '', max, SEARCH_SORT, page);
+    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+    const ranked = raw.map((it, index) => {
+      const name = String(it.name || '').toLowerCase();
+      const matches = terms.filter(term => name.includes(term)).length;
+      const score = (matches / Math.max(1, terms.length)) * 100 + (name.startsWith(q.toLowerCase()) ? 20 : 0) + Math.log1p(it.pop || 0);
+      return { it, score, index };
+    }).sort((a, b) => b.score - a.score || a.index - b.index).map(x => x.it);
+    const items = await sharpOnly(ranked, max);
+    return res.json({ ok: true, source: 'cj', currency: cur, page, hasMore: raw.length >= max, items: present(items, cur) });
   } catch (e) {
     console.error('catalog/search:', e.message);
-    const localItems = localCatalog(cur).filter(x => `${x.name || ''} ${x.category || ''}`.toLowerCase().includes(q.toLowerCase())).slice(0, max);
-    if (localItems.length) return res.json({ ok: true, source: 'fallback', currency: cur, items: localItems });
-    res.status(503).json({ ok: false, error: 'Recherche temporairement indisponible', currency: cur, items: [] });
+    res.status(503).json({ ok: false, error: 'Recherche CJ temporairement indisponible', currency: cur, page, items: [], hasMore: false });
   }
 });
 
