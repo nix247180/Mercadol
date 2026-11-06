@@ -115,42 +115,55 @@ async function cjToken(force = false) {
   })();
   try { return await cjTokenFlight; } finally { cjTokenFlight = null; }
 }
-// Une seule file globale CJ, espacée et protégée contre les rafales.
+// File globale CJ : une requête à la fois, avec un intervalle prudent.
+// En cas de HTTP 429, on arrête immédiatement les tentatives et on respecte Retry-After.
 let cjChain = Promise.resolve();
 let cjNextAt = 0;
 let cjCooldownUntil = 0;
+let cjLastError = '';
+let cjLastStatus = null;
 const cjFlights = new Map();
 async function waitForCJSlot() {
-  const now = Date.now();
-  const wait = Math.max(0, cjNextAt - now, cjCooldownUntil - now);
+  const wait = Math.max(0, cjNextAt - Date.now(), cjCooldownUntil - Date.now());
   if (wait) await sleep(wait);
-  cjNextAt = Date.now() + 1800;
+  cjNextAt = Date.now() + 8000; // au moins 8 secondes entre deux appels CJ
 }
 function cjGet(pathq) {
   if (cjFlights.has(pathq)) return cjFlights.get(pathq);
   const run = async () => {
     let last;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
       await waitForCJSlot();
       const t = await cjToken(false);
       let response;
       try { response = await fetch(CJ + pathq, { headers: { 'CJ-Access-Token': t }, signal: AbortSignal.timeout(18000) }); }
-      catch (e) { last = e; if (attempt === 2) throw e; await sleep(1500 * (attempt + 1)); continue; }
+      catch (e) { last = e; cjLastError = String(e.message || e).slice(0, 300); if (attempt === 0) { await sleep(3000); continue; } throw e; }
       const d = await response.json().catch(() => ({}));
+      cjLastStatus = response.status;
       if (response.status === 429) {
-        const retry = Number(response.headers.get('retry-after')) * 1000;
-        const delay = Math.max(retry || 0, 4000 * (2 ** attempt)) + Math.floor(Math.random() * 900);
+        const header = response.headers.get('retry-after');
+        const retrySeconds = Number(header);
+        const retryDate = header && !Number.isFinite(retrySeconds) ? Date.parse(header) - Date.now() : 0;
+        const delay = Math.max(60000, Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds * 1000 : 0, retryDate > 0 ? retryDate : 0);
         cjCooldownUntil = Date.now() + delay;
-        last = new Error(`CJ catalogue HTTP 429 (nouvel essai dans ${Math.ceil(delay/1000)} s)`);
-        if (attempt === 2) throw last;
-        continue;
+        const detail = [d.code, d.message, d.msg].filter(Boolean).join(' | ');
+        cjLastError = `HTTP 429${detail ? ' — ' + detail : ''}`.slice(0, 300);
+        console.error('CJ 429 DETAILS:', { code: d.code || null, message: d.message || d.msg || null, retryAfter: header || null, cooldownSeconds: Math.ceil(delay / 1000) });
+        throw new Error(`CJ catalogue HTTP 429 (pause de ${Math.ceil(delay / 1000)} s)`);
       }
       if (response.status === 401 || response.status === 403) {
         cjTok = { t: '', exp: 0 };
-        if (attempt < 2) continue;
+        if (attempt === 0) continue;
       }
-      if (!response.ok) throw new Error(`CJ catalogue HTTP ${response.status}`);
-      if (d.result === false && /token|auth/i.test(d.message || '') && attempt < 2) { cjTok = { t: '', exp: 0 }; continue; }
+      if (!response.ok) {
+        cjLastError = `HTTP ${response.status}: ${String(d.message || d.msg || '').slice(0, 200)}`;
+        throw new Error(`CJ catalogue HTTP ${response.status}`);
+      }
+      if (d.result === false) {
+        cjLastError = `CJ result=false: ${String(d.code || '')} ${String(d.message || d.msg || '').slice(0, 200)}`;
+        if (/token|auth/i.test(d.message || d.msg || '') && attempt === 0) { cjTok = { t: '', exp: 0 }; continue; }
+        console.error('CJ listV2 refusé:', cjLastError);
+      } else { cjLastError = ''; cjLastStatus = response.status; }
       return d;
     }
     throw last || new Error('CJ indisponible');
@@ -166,10 +179,8 @@ const CAT_Q = { // mots-clés « tendance / stylé » envoyés à CJ
   Computers: 'gaming rgb', Fitness: 'fitness band', Sports: 'sports outdoor', Watches: 'smart watch',
   Beauty: 'beauty tools', Automotive: 'car led accessories', Toys: 'fidget toys'
 };
-// Accueil = un mélange de toutes les catégories, avec le Bluetooth et les montres en tête
-const HOME_MIX = [['Electronics', 'bluetooth earbuds'], ['Watches', 'smart watch'], ['Fashion', 'stylish streetwear'],
-  ['Electronics', 'bluetooth speaker'], ['Home', 'led light decor'], ['Phones', 'stylish phone case'],
-  ['Computers', 'gaming rgb'], ['Beauty', 'beauty tools'], ['Fitness', 'fitness band']];
+// Accueil : UNE seule requête CJ au démarrage. Les autres catégories sont demandées à l'ouverture.
+const HOME_MIX = [['Electronics', 'bluetooth earbuds']];
 const CJ_MIN_USD = 1;
 const CJ_MAX_USD = 15;
 const COOL = `&orderBy=1&sort=asc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // filtre économique réservé à la sélection de l'accueil
@@ -199,11 +210,8 @@ function searchTerms(q) {
   let translated = original;
   for (const [pattern, replacement] of SEARCH_ALIASES) translated = translated.replace(pattern, replacement);
   if (translated.toLowerCase() !== original.toLowerCase()) terms.push(translated);
-  // Pour une recherche de plusieurs mots, les termes séparés élargissent la recherche CJ
-  // uniquement en complément, jamais à la place de la requête exacte.
-  const words = original.split(/\s+/).filter(w => w.length >= 3);
-  if (words.length >= 2) terms.push(...words);
-  return [...new Set(terms.map(x => x.trim()).filter(Boolean))].slice(0, 5);
+  // Maximum deux appels : requête originale, puis une seule variante traduite si nécessaire.
+  return [...new Set(terms.map(x => x.trim()).filter(Boolean))].slice(0, 2);
 }
 
 function mapCJ(list, cat, allowAnyPrice = false) { // prix affiché = prix fournisseur + marge
@@ -229,12 +237,15 @@ function persistCJCache() {
 }
 async function cjItems(q, cat, size = 40, extra = '', page = 1, allowAnyPrice = false) {
   const k = q + '|' + size + '|' + extra + '|' + page + '|' + allowAnyPrice, hit = kwCache.get(k);
-  if (hit && Date.now() - hit.at < 20 * 60000) return hit.items.map(x => ({ ...x, category: cat || x.category }));
+  if (hit && Date.now() - hit.at < 20 * 60000 && (hit.items.length || Date.now() < (hit.emptyUntil || 0)))
+    return hit.items.map(x => ({ ...x, category: cat || x.category }));
   const d = await cjGet(`/product/listV2?page=${page}&size=${size}${q ? '&keyWord=' + encodeURIComponent(q) : ''}${extra}`);
   if (d.result === false || !d.data) console.error('CJ listV2 refusé :', d.code, d.message);
   const raw = (d.data?.content || []).flatMap(c => c.productList || []).concat(d.data?.list || []);
   const items = mapCJ(raw, cat, allowAnyPrice);
-  if (items.length) { kwCache.set(k, { at: Date.now(), items }); persistCJCache(); }
+  // Mémorise aussi une réponse vide pendant 2 minutes pour éviter de marteler CJ.
+  kwCache.set(k, { at: Date.now(), items, emptyUntil: items.length ? 0 : Date.now() + 2 * 60000 });
+  persistCJCache();
   return items;
 }
 // Accueil : prix bas (50 %) + popularité CJ (30 %) + pertinence (20 %)
@@ -335,16 +346,13 @@ async function buildHome(cat) {
   const one = cat && cat !== 'All', ck = cat || 'All';
   let items;
   if (one) {
-    items = await cjItems(CAT_Q[cat] || cat, cat, 60, COOL);
-    if (!items.length) items = await cjItems(CAT_Q[cat] || cat, cat, 60);
+    // Une seule recherche par catégorie. Aucun second appel automatique si CJ renvoie vide.
+    items = await cjItems(CAT_Q[cat] || cat, cat, 24, COOL);
     items = rankCool(items);
   } else {
-    const groups = [];
-    for (const [c, q] of HOME_MIX) {
-      try { const g = await cjItems(q, c, 24, COOL); if (g.length) groups.push(rankCool(g).slice(0, 10)); }
-      catch (e) { if (/token|CJ_API_KEY/i.test(e.message)) throw e; console.error('accueil', q, e.message); }
-    }
-    items = interleave(groups);
+    // Accueil volontairement limité à un seul mot-clé CJ pour réduire les HTTP 429.
+    const [c, q] = HOME_MIX[0];
+    items = rankCool(await cjItems(q, c, 24, COOL));
   }
   if (!items.length) throw new Error('catalogue vide (voir « CJ listV2 refusé » plus haut dans les logs)');
   const out = await sharpOnly(items.slice(0, 90), 80);
@@ -517,8 +525,9 @@ app.get('/api/cj-status', limit('cs', 8, 3600000), async (req, res) => {
   const out = { cleCJ: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN) };
   try {
     await cjToken(false); out.jeton = 'ok';
-    out.catalogue = 'non testé (diagnostic sans requête catalogue afin de préserver le quota CJ)';
-    out.derniereErreur = cjCooldownUntil > Date.now() ? 'limitation temporaire CJ active' : 'aucune erreur récente mémorisée';
+    out.catalogue = cjLastStatus ? `dernier statut HTTP ${cjLastStatus}` : 'pas encore testé';
+    out.derniereErreur = cjLastError || (cjCooldownUntil > Date.now() ? 'limitation temporaire CJ active' : 'aucune erreur récente mémorisée');
+    out.pauseCJSecondes = Math.max(0, Math.ceil((cjCooldownUntil - Date.now()) / 1000));
   } catch (e) { out.erreur = String(e.message).slice(0, 200); }
   res.json(out);
 });
@@ -860,6 +869,6 @@ app.use((e, req, res, next) => {
 if (E.MERCADO_TEST) module.exports = { interleave, rankCool, HOME_MIX, cjItems, homeItems, num, mapCJ, cjDetail, rank, present, keywords, settleCamerPay, cleanCustomer, cmPhone, toPay, serverTotal, imgSize };
 else app.listen(PORT, '0.0.0.0', () => {
   console.log(`MERCADO port ${PORT} | marge ${PROFIT_USD} USD | CamerPay ${CAMERPAY_TOKEN ? 'configuré' : 'non configuré'}`);
-  setTimeout(() => homeItems('All').catch(e => console.error('préchargement:', e.message)), 12000); // laisse le serveur démarrer sans rafale CJ
-  setInterval(() => { if (cjCooldownUntil <= Date.now()) refreshHome('All').catch(() => {}); }, 20 * 60000);
+  // Un seul préchargement de l'accueil après démarrage. Pas de rafraîchissement périodique automatique.
+  setTimeout(() => homeItems('All').catch(e => console.error('préchargement:', e.message)), 12000);
 });
