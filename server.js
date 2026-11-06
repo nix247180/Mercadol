@@ -147,6 +147,36 @@ const CJ_MAX_USD = 15;
 const COOL = `&orderBy=1&sort=asc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // filtre économique réservé à la sélection de l'accueil
 const SEARCH_SORT = '&orderBy=1&sort=desc'; // recherche client sans plafond de prix
 
+// Élargit les recherches en français vers les termes généralement employés dans le catalogue CJ.
+// La requête originale reste toujours prioritaire ; les variantes servent à compléter les résultats.
+const SEARCH_ALIASES = [
+  [/\b(chaussure|chaussures|basket|baskets)\b/gi, 'shoes sneakers'],
+  [/\b(telephone|téléphone|smartphone|portable)\b/gi, 'phone smartphone'],
+  [/\b(ordinateur|pc|portable informatique)\b/gi, 'laptop computer'],
+  [/\b(ecouteur|écouteur|ecouteurs|écouteurs)\b/gi, 'earbuds headphones'],
+  [/\b(montre|montres)\b/gi, 'watch smart watch'],
+  [/\b(robe|robes)\b/gi, 'dress women dress'],
+  [/\b(sac|sacs|sac a main|sac à main)\b/gi, 'bag handbag'],
+  [/\b(lampe|lampes)\b/gi, 'lamp light'],
+  [/\b(led|lumiere|lumière)\b/gi, 'led light'],
+  [/\b(maison|decoration|décoration)\b/gi, 'home decor'],
+  [/\b(beaute|beauté|maquillage)\b/gi, 'beauty makeup'],
+  [/\b(telephone case|coque|coques)\b/gi, 'phone case'],
+  [/\b(football|ballon)\b/gi, 'soccer ball football'],
+  [/\b(voiture|auto|automobile)\b/gi, 'car accessories']
+];
+function searchTerms(q) {
+  const original = String(q || '').trim().replace(/\s+/g, ' ');
+  const terms = [original];
+  let translated = original;
+  for (const [pattern, replacement] of SEARCH_ALIASES) translated = translated.replace(pattern, replacement);
+  if (translated.toLowerCase() !== original.toLowerCase()) terms.push(translated);
+  // Pour une recherche de plusieurs mots, les termes séparés élargissent la recherche CJ
+  // uniquement en complément, jamais à la place de la requête exacte.
+  const words = original.split(/\s+/).filter(w => w.length >= 3);
+  if (words.length >= 2) terms.push(...words);
+  return [...new Set(terms.map(x => x.trim()).filter(Boolean))].slice(0, 5);
+}
 
 function mapCJ(list, cat, allowAnyPrice = false) { // prix affiché = prix fournisseur + marge
   return (list || []).map((x, i) => {
@@ -232,25 +262,38 @@ async function imgPx(url) {
   return px;
 }
 async function sharpOnly(list, max) {
-  const candidates = list.slice(0, Math.min(list.length, 18));
-  const checks = await Promise.all(candidates.map(async (x) => ({ ...x, px: await imgPx(x.image) })));
-  const good = checks.filter(x => x.px >= MIN_IMG);
-  const unknownOrOther = checks.filter(x => x.px < MIN_IMG).sort((a, b) => b.px - a.px);
-  const ordered = good.concat(unknownOrOther, list.slice(candidates.length));
+  // La vérification des dimensions ne bloque plus le premier affichage.
+  // Les URL proviennent déjà de CJ ; leurs dimensions sont mises en cache en arrière-plan.
   const seen = new Set();
-  return ordered.filter(x => !seen.has(x.id) && seen.add(x.id)).slice(0, max);
+  const out = list.filter(x => x && x.id && !seen.has(x.id) && seen.add(x.id)).slice(0, max);
+  for (const item of out.slice(0, 12)) {
+    if (!imgCache.has(item.image)) imgPx(item.image).catch(() => {});
+  }
+  return out;
 }
 
-/* ---------- CATALOGUE ---------- */
+/* ---------- CATALOGUE CJ : CACHE FRAIS + STALE-WHILE-REVALIDATE ---------- */
 const homeCache = new Map();
-const building = new Map(); // un seul chargement à la fois par catégorie (CJ : 1 requête/seconde)
+const building = new Map(); // un seul rafraîchissement à la fois par catégorie
+function refreshHome(cat) {
+  const ck = cat || 'All';
+  if (building.has(ck)) return building.get(ck);
+  const p = buildHome(cat).catch(err => {
+    console.error('rafraîchissement CJ:', ck, err.message);
+    throw err;
+  }).finally(() => building.delete(ck));
+  building.set(ck, p);
+  return p;
+}
 function homeItems(cat) {
   const ck = cat || 'All', hit = homeCache.get(ck);
   if (hit && Date.now() - hit.at < 600000) return Promise.resolve(hit.items);
-  if (building.has(ck)) return building.get(ck);
-  const p = buildHome(cat).finally(() => building.delete(ck));
-  building.set(ck, p);
-  return p;
+  // Si un ancien cache CJ existe, on le sert immédiatement pendant l'actualisation.
+  if (hit && hit.items?.length) {
+    refreshHome(cat).catch(() => {});
+    return Promise.resolve(hit.items);
+  }
+  return refreshHome(cat);
 }
 async function buildHome(cat) {
   const one = cat && cat !== 'All', ck = cat || 'All';
@@ -290,9 +333,9 @@ function sendCatalogHeaders(res) {
   res.setHeader('Vary', 'Accept-Encoding');
 }
 function catalogFallback(cat, cur, max) {
+  // Ne jamais mélanger un catalogue local d'origine incertaine avec les produits CJ.
   const stale = homeCache.get(cat || 'All');
-  const items = stale?.items?.length ? stale.items : localCatalog(cur);
-  return present(items.slice(0, max), cur);
+  return stale?.items?.length ? present(stale.items.slice(0, max), cur) : [];
 }
 app.get('/api/catalog/home', async (req, res) => {
   const cur = curOf(req.query), cat = String(req.query.cat || 'All').slice(0, 60) || 'All';
@@ -305,7 +348,7 @@ app.get('/api/catalog/home', async (req, res) => {
   } catch (e) {
     console.error('catalog/home:', e.message);
     const fallback = catalogFallback(cat, cur, max);
-    if (fallback.length) return res.json({ ok: true, source: 'fallback', currency: cur, items: fallback, warning: 'Catalogue CJ temporairement indisponible' });
+    if (fallback.length) return res.json({ ok: true, source: 'cj-cache', currency: cur, items: fallback, warning: 'Affichage du dernier catalogue CJ enregistré' });
     res.status(503).json({ ok: false, error: 'Catalogue temporairement indisponible', currency: cur, items: [] });
   }
 });
@@ -317,10 +360,21 @@ app.get('/api/catalog/search', async (req, res) => {
   if (!q) return res.json({ ok: true, source: 'cj', currency: cur, items: [], hasMore: false, page });
   try {
     await refreshRates();
-    // Recherche directe CJ, sans le filtre de prix réservé à la page d'accueil.
-    const items = await sharpOnly(await cjItems(q, '', max, SEARCH_SORT, page, true), max);
+    // La recherche part d'abord chez CJ avec les mots saisis par le client.
+    // Des variantes FR/EN et les mots individuels complètent ensuite les résultats,
+    // puis MERCADO reformate les produits et applique sa marge sans exposer CJ.
+    const terms = searchTerms(q);
+    const merged = new Map();
+    let hasMore = false;
+    for (const term of terms) {
+      const found = await cjItems(term, '', max, SEARCH_SORT, page, true);
+      if (found.length >= max) hasMore = true;
+      for (const item of found) if (!merged.has(item.id)) merged.set(item.id, item);
+      if (merged.size >= max) break;
+    }
+    const items = [...merged.values()].slice(0, max);
     const ranked = rankCool(items);
-    res.json({ ok: true, source: 'cj', currency: cur, items: present(ranked, cur), page, hasMore: items.length >= max });
+    res.json({ ok: true, source: 'mercado', currency: cur, items: present(ranked, cur), page, hasMore: hasMore || merged.size >= max, expanded: terms.length > 1 });
   } catch (e) {
     console.error('catalog/search:', e.message);
     res.status(503).json({ ok: false, error: 'Recherche CJ temporairement indisponible', currency: cur, items: [], hasMore: false, page });
@@ -770,5 +824,5 @@ if (E.MERCADO_TEST) module.exports = { interleave, rankCool, HOME_MIX, cjItems, 
 else app.listen(PORT, '0.0.0.0', () => {
   console.log(`MERCADO port ${PORT} | marge ${PROFIT_USD} USD | CamerPay ${CAMERPAY_TOKEN ? 'configuré' : 'non configuré'}`);
   setTimeout(() => homeItems('All').catch(e => console.error('préchargement:', e.message)), 4000); // accueil prêt avant la 1re visite
-  setInterval(() => { homeCache.delete('All'); homeItems('All').catch(() => {}); }, 9 * 60000);
+  setInterval(() => { refreshHome('All').catch(() => {}); }, 9 * 60000);
 });
