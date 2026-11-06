@@ -174,17 +174,29 @@ function cjGet(pathq) {
   return p;
 }
 const cjUrl = id => `https://cjdropshipping.com/product/-p-${id}.html`;
-const CAT_Q = { // mots-clés « tendance / stylé » envoyés à CJ
-  Electronics: 'bluetooth earbuds', Fashion: 'stylish streetwear', Home: 'led light decor', Phones: 'stylish phone case',
-  Computers: 'gaming rgb', Fitness: 'fitness band', Sports: 'sports outdoor', Watches: 'smart watch',
-  Beauty: 'beauty tools', Automotive: 'car led accessories', Toys: 'fidget toys'
+// Mots-clés CJ concrets par catégorie. Les termes marketing trop vagues
+// (ex. « stylish streetwear ») renvoyaient souvent zéro résultat.
+const CAT_TERMS = {
+  Electronics: ['bluetooth earbuds', 'wireless headphones', 'electronic accessories'],
+  Fashion: ['women clothing', 'men clothing', 'fashion accessories'],
+  Home: ['home kitchen products', 'home decor', 'kitchen accessories'],
+  Phones: ['phone case', 'mobile phone accessories', 'phone holder'],
+  Computers: ['computer accessories', 'laptop accessories', 'computer mouse keyboard'],
+  Fitness: ['fitness equipment', 'resistance bands', 'sports fitness accessories'],
+  Sports: ['sports accessories', 'outdoor sports equipment', 'camping accessories'],
+  Watches: ['wrist watch', 'quartz watch', 'smart watch'],
+  Beauty: ['beauty makeup tools', 'skincare tools', 'hair accessories'],
+  Automotive: ['car accessories', 'car interior accessories', 'car led lights'],
+  Toys: ['kids toys', 'educational toys', 'toy accessories']
 };
+const CAT_Q = Object.fromEntries(Object.entries(CAT_TERMS).map(([cat, terms]) => [cat, terms[0]]));
 // Accueil : UNE seule requête CJ au démarrage. Les autres catégories sont demandées à l'ouverture.
 const HOME_MIX = [['Electronics', 'bluetooth earbuds']];
 const CJ_MIN_USD = 1;
 const CJ_MAX_USD = 15;
 const COOL = `&orderBy=1&sort=asc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // filtre économique réservé à la sélection de l'accueil
 const SEARCH_SORT = '&orderBy=1&sort=desc'; // recherche client sans plafond de prix
+const CATEGORY_SORT = '&orderBy=1&sort=asc'; // catégories : privilégier les prix fournisseur bas sans exclure les autres
 
 // Élargit les recherches en français vers les termes généralement employés dans le catalogue CJ.
 // La requête originale reste toujours prioritaire ; les variantes servent à compléter les résultats.
@@ -346,10 +358,14 @@ async function buildHome(cat) {
   const one = cat && cat !== 'All', ck = cat || 'All';
   let items;
   if (one) {
-    // Toutes les catégories privilégient les produits CJ économiques (prix fournisseur 1–15 USD).
-    // La marge cachée de 10 USD est ajoutée ensuite, comme sur l'accueil.
-    // Une seule requête CJ est faite pour la catégorie demandée.
-    items = await cjItems(CAT_Q[cat] || cat, cat, 24, COOL, 1, false);
+    // Essaie les mots-clés CJ concrets de cette catégorie jusqu'à obtenir des produits.
+    // Les appels sont séquentiels : on évite de multiplier les requêtes simultanées.
+    const terms = CAT_TERMS[cat] || [cat];
+    items = [];
+    for (const term of terms) {
+      items = await cjItems(term, cat, 48, CATEGORY_SORT, 1, true);
+      if (items.length) break;
+    }
     items = rankCool(items);
   } else {
     // Accueil volontairement limité à un seul mot-clé CJ pour réduire les HTTP 429.
