@@ -346,8 +346,10 @@ async function buildHome(cat) {
   const one = cat && cat !== 'All', ck = cat || 'All';
   let items;
   if (one) {
-    // Une seule recherche par catégorie. Aucun second appel automatique si CJ renvoie vide.
-    items = await cjItems(CAT_Q[cat] || cat, cat, 24, COOL);
+    // Toutes les catégories privilégient les produits CJ économiques (prix fournisseur 1–15 USD).
+    // La marge cachée de 10 USD est ajoutée ensuite, comme sur l'accueil.
+    // Une seule requête CJ est faite pour la catégorie demandée.
+    items = await cjItems(CAT_Q[cat] || cat, cat, 24, COOL, 1, false);
     items = rankCool(items);
   } else {
     // Accueil volontairement limité à un seul mot-clé CJ pour réduire les HTTP 429.
@@ -405,14 +407,14 @@ app.get('/api/catalog/search', async (req, res) => {
   if (!q) return res.json({ ok: true, source: 'cj', currency: cur, items: [], hasMore: false, page });
   try {
     await refreshRates();
-    // La recherche part d'abord chez CJ avec les mots saisis par le client.
-    // Des variantes FR/EN et les mots individuels complètent ensuite les résultats,
-    // puis MERCADO reformate les produits et applique sa marge sans exposer CJ.
+    // La recherche part chez CJ avec les mots saisis par le client et privilégie
+    // les produits dont le prix fournisseur est compris entre 1 et 15 USD.
+    // La marge cachée de 10 USD est ajoutée par MERCADO.
     const terms = searchTerms(q);
     const merged = new Map();
     let hasMore = false;
     for (const term of terms) {
-      const found = await cjItems(term, '', max, SEARCH_SORT, page, true);
+      const found = await cjItems(term, '', max, COOL, page, false);
       if (found.length >= max) hasMore = true;
       for (const item of found) if (!merged.has(item.id)) merged.set(item.id, item);
       if (merged.size >= max) break;
