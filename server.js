@@ -96,9 +96,12 @@ const withProfit = base => Math.round((base + PROFIT_USD) * 100) / 100;
 /* ---------- CJ DROPSHIPPING ---------- */
 const CJ = 'https://developers.cjdropshipping.com/api2.0/v1';
 let cjTok = { t: '', exp: 0 };
-async function cjToken(force) {
+let cjTokenFlight = null;
+async function cjToken(force = false) {
   if (E.CJ_ACCESS_TOKEN) return E.CJ_ACCESS_TOKEN;
   if (!force && cjTok.t && Date.now() < cjTok.exp) return cjTok.t;
+  if (cjTokenFlight) return cjTokenFlight;
+  cjTokenFlight = (async () => {
   if (!E.CJ_API_KEY) throw new Error('CJ_API_KEY manquante');
   const r = await fetch(`${CJ}/authentication/getAccessToken`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -107,28 +110,53 @@ async function cjToken(force) {
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`CJ authentification HTTP ${r.status}`);
   if (!d.data?.accessToken) throw new Error('CJ token refusé : ' + (d.message || r.status));
-  cjTok = { t: d.data.accessToken, exp: Date.now() + 14 * 24 * 3600000 }; // valable 180 jours, on renouvelle avant
-  await sleep(1100); // CJ : 1 requête par seconde maximum
+  cjTok = { t: d.data.accessToken, exp: Date.now() + 14 * 24 * 3600000 };
   return cjTok.t;
+  })();
+  try { return await cjTokenFlight; } finally { cjTokenFlight = null; }
 }
-// CJ limite le débit (environ 1 requête/seconde) : on fait la queue
+// Une seule file globale CJ, espacée et protégée contre les rafales.
 let cjChain = Promise.resolve();
+let cjNextAt = 0;
+let cjCooldownUntil = 0;
+const cjFlights = new Map();
+async function waitForCJSlot() {
+  const now = Date.now();
+  const wait = Math.max(0, cjNextAt - now, cjCooldownUntil - now);
+  if (wait) await sleep(wait);
+  cjNextAt = Date.now() + 1800;
+}
 function cjGet(pathq) {
+  if (cjFlights.has(pathq)) return cjFlights.get(pathq);
   const run = async () => {
-    let d;
-    for (let k = 0; k < 2; k++) {
-      const t = await cjToken(k > 0);
-      const response = await fetch(CJ + pathq, {
-        headers: { 'CJ-Access-Token': t }, signal: AbortSignal.timeout(18000)
-      });
-      d = await response.json().catch(() => ({}));
+    let last;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await waitForCJSlot();
+      const t = await cjToken(false);
+      let response;
+      try { response = await fetch(CJ + pathq, { headers: { 'CJ-Access-Token': t }, signal: AbortSignal.timeout(18000) }); }
+      catch (e) { last = e; if (attempt === 2) throw e; await sleep(1500 * (attempt + 1)); continue; }
+      const d = await response.json().catch(() => ({}));
+      if (response.status === 429) {
+        const retry = Number(response.headers.get('retry-after')) * 1000;
+        const delay = Math.max(retry || 0, 4000 * (2 ** attempt)) + Math.floor(Math.random() * 900);
+        cjCooldownUntil = Date.now() + delay;
+        last = new Error(`CJ catalogue HTTP 429 (nouvel essai dans ${Math.ceil(delay/1000)} s)`);
+        if (attempt === 2) throw last;
+        continue;
+      }
+      if (response.status === 401 || response.status === 403) {
+        cjTok = { t: '', exp: 0 };
+        if (attempt < 2) continue;
+      }
       if (!response.ok) throw new Error(`CJ catalogue HTTP ${response.status}`);
-      if (d.result !== false || !/token|auth/i.test(d.message || '')) break;
+      if (d.result === false && /token|auth/i.test(d.message || '') && attempt < 2) { cjTok = { t: '', exp: 0 }; continue; }
+      return d;
     }
-    await sleep(1100);
-    return d;
+    throw last || new Error('CJ indisponible');
   };
-  const p = cjChain.then(run, run);
+  const p = cjChain.then(run, run).finally(() => cjFlights.delete(pathq));
+  cjFlights.set(pathq, p);
   cjChain = p.catch(() => {});
   return p;
 }
@@ -190,7 +218,15 @@ function mapCJ(list, cat, allowAnyPrice = false) { // prix affiché = prix fourn
       itemUrl: cjUrl(x.id), category: cat || '', pop: num(x.listedNum || x.listedCount || x.salesVolume), pos: i };
   }).filter(Boolean);
 }
-const kwCache = new Map(); // mot-clé + page -> {at, items}
+const CACHE_FILE = F('cj-catalog-cache.json');
+const savedCJ = rd('cj-catalog-cache.json', { home: [], keywords: [] });
+const kwCache = new Map(Array.isArray(savedCJ.keywords) ? savedCJ.keywords : []); // cache CJ persistant
+function persistCJCache() {
+  try {
+    const payload = { home: [...homeCache.entries()], keywords: [...kwCache.entries()].slice(-250) };
+    const tmp = CACHE_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(payload)); fs.renameSync(tmp, CACHE_FILE);
+  } catch (e) { console.error('cache CJ disque:', e.message); }
+}
 async function cjItems(q, cat, size = 40, extra = '', page = 1, allowAnyPrice = false) {
   const k = q + '|' + size + '|' + extra + '|' + page + '|' + allowAnyPrice, hit = kwCache.get(k);
   if (hit && Date.now() - hit.at < 20 * 60000) return hit.items.map(x => ({ ...x, category: cat || x.category }));
@@ -198,7 +234,7 @@ async function cjItems(q, cat, size = 40, extra = '', page = 1, allowAnyPrice = 
   if (d.result === false || !d.data) console.error('CJ listV2 refusé :', d.code, d.message);
   const raw = (d.data?.content || []).flatMap(c => c.productList || []).concat(d.data?.list || []);
   const items = mapCJ(raw, cat, allowAnyPrice);
-  if (items.length) kwCache.set(k, { at: Date.now(), items });
+  if (items.length) { kwCache.set(k, { at: Date.now(), items }); persistCJCache(); }
   return items;
 }
 // Accueil : prix bas (50 %) + popularité CJ (30 %) + pertinence (20 %)
@@ -273,7 +309,7 @@ async function sharpOnly(list, max) {
 }
 
 /* ---------- CATALOGUE CJ : CACHE FRAIS + STALE-WHILE-REVALIDATE ---------- */
-const homeCache = new Map();
+const homeCache = new Map(Array.isArray(savedCJ.home) ? savedCJ.home : []);
 const building = new Map(); // un seul rafraîchissement à la fois par catégorie
 function refreshHome(cat) {
   const ck = cat || 'All';
@@ -313,6 +349,7 @@ async function buildHome(cat) {
   if (!items.length) throw new Error('catalogue vide (voir « CJ listV2 refusé » plus haut dans les logs)');
   const out = await sharpOnly(items.slice(0, 90), 80);
   homeCache.set(ck, { at: Date.now(), items: out });
+  persistCJCache();
   return out;
 }
 const localCatalog = cur => rd('products.json', [])
@@ -479,9 +516,9 @@ app.get('/api/catalog/similar', async (req, res) => {
 app.get('/api/cj-status', limit('cs', 8, 3600000), async (req, res) => {
   const out = { cleCJ: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN) };
   try {
-    await cjToken(true); out.jeton = 'ok';
-    const d = await cjGet('/product/listV2?page=1&size=3&keyWord=hoodie');
-    out.liste = { code: d.code, result: d.result, message: d.message, produits: (d.data?.content || []).flatMap(c => c.productList || []).length };
+    await cjToken(false); out.jeton = 'ok';
+    out.catalogue = 'non testé (diagnostic sans requête catalogue afin de préserver le quota CJ)';
+    out.derniereErreur = cjCooldownUntil > Date.now() ? 'limitation temporaire CJ active' : 'aucune erreur récente mémorisée';
   } catch (e) { out.erreur = String(e.message).slice(0, 200); }
   res.json(out);
 });
@@ -823,6 +860,6 @@ app.use((e, req, res, next) => {
 if (E.MERCADO_TEST) module.exports = { interleave, rankCool, HOME_MIX, cjItems, homeItems, num, mapCJ, cjDetail, rank, present, keywords, settleCamerPay, cleanCustomer, cmPhone, toPay, serverTotal, imgSize };
 else app.listen(PORT, '0.0.0.0', () => {
   console.log(`MERCADO port ${PORT} | marge ${PROFIT_USD} USD | CamerPay ${CAMERPAY_TOKEN ? 'configuré' : 'non configuré'}`);
-  setTimeout(() => homeItems('All').catch(e => console.error('préchargement:', e.message)), 4000); // accueil prêt avant la 1re visite
-  setInterval(() => { refreshHome('All').catch(() => {}); }, 9 * 60000);
+  setTimeout(() => homeItems('All').catch(e => console.error('préchargement:', e.message)), 12000); // laisse le serveur démarrer sans rafale CJ
+  setInterval(() => { if (cjCooldownUntil <= Date.now()) refreshHome('All').catch(() => {}); }, 20 * 60000);
 });
