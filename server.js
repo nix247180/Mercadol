@@ -95,7 +95,8 @@ const withProfit = base => Math.round((base + PROFIT_USD) * 100) / 100;
 
 /* ---------- CJ DROPSHIPPING ---------- */
 const CJ = 'https://developers.cjdropshipping.com/api2.0/v1';
-let cjTok = { t: '', exp: 0 };
+// Le jeton est conservé sur disque : CJ n'autorise qu'un nouveau jeton toutes les 5 minutes.
+let cjTok = rd('cj-token.json', { t: '', exp: 0 });
 let cjTokenFlight = null;
 async function cjToken(force = false) {
   if (E.CJ_ACCESS_TOKEN) return E.CJ_ACCESS_TOKEN;
@@ -108,9 +109,11 @@ async function cjToken(force = false) {
     body: JSON.stringify({ apiKey: E.CJ_API_KEY }), signal: AbortSignal.timeout(12000)
   });
   const d = await r.json().catch(() => ({}));
+  if (r.status === 429) cjCooldownUntil = Date.now() + 5 * 60000;
   if (!r.ok) throw new Error(`CJ authentification HTTP ${r.status}`);
   if (!d.data?.accessToken) throw new Error('CJ token refusé : ' + (d.message || r.status));
   cjTok = { t: d.data.accessToken, exp: Date.now() + 14 * 24 * 3600000 };
+  try { wr('cj-token.json', cjTok); } catch {}
   return cjTok.t;
   })();
   try { return await cjTokenFlight; } finally { cjTokenFlight = null; }
@@ -123,16 +126,18 @@ let cjCooldownUntil = 0;
 let cjLastError = '';
 let cjLastStatus = null;
 const cjFlights = new Map();
+const CJ_GAP_MS = Number(E.CJ_GAP_MS || 1500); // intervalle entre deux appels CJ
+let cjPending = 0; // nombre d'appels CJ en attente (sert à laisser la priorité aux clients)
 async function waitForCJSlot() {
   const wait = Math.max(0, cjNextAt - Date.now(), cjCooldownUntil - Date.now());
   if (wait) await sleep(wait);
-  cjNextAt = Date.now() + 8000; // au moins 8 secondes entre deux appels CJ
+  cjNextAt = Date.now() + CJ_GAP_MS;
 }
 function cjGet(pathq) {
   if (cjFlights.has(pathq)) return cjFlights.get(pathq);
   const run = async () => {
     let last;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       await waitForCJSlot();
       const t = await cjToken(false);
       let response;
@@ -144,7 +149,7 @@ function cjGet(pathq) {
         const header = response.headers.get('retry-after');
         const retrySeconds = Number(header);
         const retryDate = header && !Number.isFinite(retrySeconds) ? Date.parse(header) - Date.now() : 0;
-        const delay = Math.max(60000, Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds * 1000 : 0, retryDate > 0 ? retryDate : 0);
+        const delay = Math.max(15000, Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds * 1000 : 0, retryDate > 0 ? retryDate : 0);
         cjCooldownUntil = Date.now() + delay;
         const detail = [d.code, d.message, d.msg].filter(Boolean).join(' | ');
         cjLastError = `HTTP 429${detail ? ' — ' + detail : ''}`.slice(0, 300);
@@ -160,6 +165,13 @@ function cjGet(pathq) {
         throw new Error(`CJ catalogue HTTP ${response.status}`);
       }
       if (d.result === false) {
+        // CJ signale parfois la limite de débit avec un HTTP 200 : on patiente puis on réessaie.
+        if (d.code === 1600200 || /too many|rate limit|frequen/i.test(String(d.message || d.msg || ''))) {
+          cjCooldownUntil = Date.now() + 5000;
+          cjLastError = 'CJ limite de débit (code ' + d.code + ')';
+          if (attempt < 2) continue;
+          throw new Error('CJ limite de débit');
+        }
         cjLastError = `CJ result=false: ${String(d.code || '')} ${String(d.message || d.msg || '').slice(0, 200)}`;
         if (/token|auth/i.test(d.message || d.msg || '') && attempt === 0) { cjTok = { t: '', exp: 0 }; continue; }
         console.error('CJ listV2 refusé:', cjLastError);
@@ -168,7 +180,8 @@ function cjGet(pathq) {
     }
     throw last || new Error('CJ indisponible');
   };
-  const p = cjChain.then(run, run).finally(() => cjFlights.delete(pathq));
+  cjPending++;
+  const p = cjChain.then(run, run).finally(() => { cjFlights.delete(pathq); cjPending--; });
   cjFlights.set(pathq, p);
   cjChain = p.catch(() => {});
   return p;
@@ -194,9 +207,10 @@ const CAT_Q = Object.fromEntries(Object.entries(CAT_TERMS).map(([cat, terms]) =>
 const HOME_MIX = [['Electronics', 'bluetooth earbuds']];
 const CJ_MIN_USD = 1;
 const CJ_MAX_USD = 15;
-const COOL = `&orderBy=1&sort=asc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // filtre économique réservé à la sélection de l'accueil
+// orderBy=1 = nombre de mises en vente CJ ; desc = les plus populaires d'abord.
+const COOL = `&orderBy=1&sort=desc&startSellPrice=${CJ_MIN_USD}&endSellPrice=${CJ_MAX_USD}`; // filtre économique réservé à la sélection de l'accueil
 const SEARCH_SORT = '&orderBy=1&sort=desc'; // recherche client sans plafond de prix
-const CATEGORY_SORT = '&orderBy=1&sort=asc'; // catégories : privilégier les prix fournisseur bas sans exclure les autres
+const CATEGORY_SORT = '&orderBy=1&sort=desc'; // catégories : produits populaires d'abord, tous prix confondus
 
 // Élargit les recherches en français vers les termes généralement employés dans le catalogue CJ.
 // La requête originale reste toujours prioritaire ; les variantes servent à compléter les résultats.
@@ -425,12 +439,14 @@ app.get('/api/catalog/search', async (req, res) => {
     await refreshRates();
     // La recherche part chez CJ avec les mots saisis par le client et privilégie
     // les produits dont le prix fournisseur est compris entre 1 et 15 USD.
+    // Si ce filtre ne donne rien (page 1), on relance sans plafond de prix.
     // La marge cachée de 10 USD est ajoutée par MERCADO.
     const terms = searchTerms(q);
     const merged = new Map();
     let hasMore = false;
     for (const term of terms) {
-      const found = await cjItems(term, '', max, COOL, page, false);
+      let found = await cjItems(term, '', max, COOL, page, false);
+      if (!found.length && page === 1) found = await cjItems(term, '', max, SEARCH_SORT, page, true);
       if (found.length >= max) hasMore = true;
       for (const item of found) if (!merged.has(item.id)) merged.set(item.id, item);
       if (merged.size >= max) break;
@@ -887,6 +903,15 @@ app.use((e, req, res, next) => {
 if (E.MERCADO_TEST) module.exports = { interleave, rankCool, HOME_MIX, cjItems, homeItems, num, mapCJ, cjDetail, rank, present, keywords, settleCamerPay, cleanCustomer, cmPhone, toPay, serverTotal, imgSize };
 else app.listen(PORT, '0.0.0.0', () => {
   console.log(`MERCADO port ${PORT} | marge ${PROFIT_USD} USD | CamerPay ${CAMERPAY_TOKEN ? 'configuré' : 'non configuré'}`);
-  // Un seul préchargement de l'accueil après démarrage. Pas de rafraîchissement périodique automatique.
-  setTimeout(() => homeItems('All').catch(e => console.error('préchargement:', e.message)), 12000);
+  // Préchargement : accueil d'abord, puis les autres catégories une par une en arrière-plan.
+  // Les requêtes des clients restent prioritaires (on attend que la file CJ soit libre).
+  setTimeout(async () => {
+    try { await homeItems('All'); } catch (e) { console.error('préchargement:', e.message); }
+    if (E.CJ_PREWARM === '0') return;
+    for (const cat of Object.keys(CAT_TERMS)) {
+      while (cjPending > 0) await sleep(2000);
+      try { await homeItems(cat); } catch (e) { console.error('préchargement', cat, e.message); }
+      await sleep(3000);
+    }
+  }, 5000);
 });
