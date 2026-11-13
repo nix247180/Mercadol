@@ -110,8 +110,8 @@ async function cjToken(force = false) {
   });
   const d = await r.json().catch(() => ({}));
   if (r.status === 429) cjCooldownUntil = Date.now() + 5 * 60000;
-  if (!r.ok) throw new Error(`CJ authentification HTTP ${r.status}`);
-  if (!d.data?.accessToken) throw new Error('CJ token refusé : ' + (d.message || r.status));
+  if (!r.ok) { cjLastError = `Auth CJ HTTP ${r.status}: ${String(d.message || d.msg || '').slice(0,150)}`; throw new Error(`CJ authentification HTTP ${r.status}`); }
+  if (!d.data?.accessToken) { cjLastError = 'Auth CJ refusée : ' + String(d.message || r.status).slice(0,150) + ' (vérifiez CJ_API_KEY dans Render)'; throw new Error('CJ token refusé : ' + (d.message || r.status)); }
   cjTok = { t: d.data.accessToken, exp: Date.now() + 14 * 24 * 3600000 };
   try { wr('cj-token.json', cjTok); } catch {}
   return cjTok.t;
@@ -426,7 +426,7 @@ app.get('/api/catalog/home', async (req, res) => {
     console.error('catalog/home:', e.message);
     const fallback = catalogFallback(cat, cur, max);
     if (fallback.length) return res.json({ ok: true, source: 'cj-cache', currency: cur, items: fallback, warning: 'Affichage du dernier catalogue CJ enregistré' });
-    res.status(503).json({ ok: false, error: 'Catalogue temporairement indisponible', currency: cur, items: [] });
+    res.status(503).json({ ok: false, error: 'Catalogue temporairement indisponible', detail: cjLastError || String(e.message).slice(0,200), currency: cur, items: [] });
   }
 });
 app.get('/api/catalog/search', async (req, res) => {
@@ -456,7 +456,7 @@ app.get('/api/catalog/search', async (req, res) => {
     res.json({ ok: true, source: 'mercado', currency: cur, items: present(ranked, cur), page, hasMore: hasMore || merged.size >= max, expanded: terms.length > 1 });
   } catch (e) {
     console.error('catalog/search:', e.message);
-    res.status(503).json({ ok: false, error: 'Recherche CJ temporairement indisponible', currency: cur, items: [], hasMore: false, page });
+    res.status(503).json({ ok: false, error: 'Recherche CJ temporairement indisponible', detail: cjLastError || String(e.message).slice(0,200), currency: cur, items: [], hasMore: false, page });
   }
 });
 
@@ -878,6 +878,16 @@ app.post('/api/ai-log', limit('al', 60, 3600000), (req, res) => {
   const q = String(req.body.question || '').slice(0, 300);
   if (q) telegram(`💬 Question MERCADO AI : ${q}${req.body.product?.name ? `\n(produit : ${req.body.product.name})` : ''}`);
   res.json({ ok: true });
+});
+
+app.get('/api/cj-debug', limit('cd', 10, 3600000), async (req, res) => {
+  try {
+    const d = await cjGet('/product/listV2?page=1&size=5&keyWord=phone%20case');
+    const list = (d.data?.content || []).flatMap(c => c.productList || []).concat(d.data?.list || []);
+    res.json({ result: d.result, code: d.code, message: d.message, nombreProduits: list.length,
+      premierProduit: list[0] || null, derniereErreur: cjLastError,
+      pauseSecondes: Math.max(0, Math.ceil((cjCooldownUntil - Date.now()) / 1000)) });
+  } catch (e) { res.json({ erreur: String(e.message), derniereErreur: cjLastError }); }
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString(),
