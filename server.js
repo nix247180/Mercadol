@@ -77,8 +77,11 @@ const curOf = q => 'USD'; // MERCADO affiche tous les prix en dollars US
 let RATES = { USD:1, EUR:.92, GBP:.78, CAD:1.37, AUD:1.5, CHF:.88, BRL:5.5, INR:84, ZAR:18, MAD:10, DZD:135, TND:3.1, EGP:48,
   NGN:1500, GHS:15, KES:130, AED:3.67, JPY:150, MXN:18, XAF:603, XOF:603 }; // secours, remplacés par les taux du jour
 let ratesAt = 0;
+let ratesTryAt = 0; // dernière tentative (évite de retenter à chaque requête si le service de taux est lent)
 async function refreshRates() {
   if (Date.now() - ratesAt < 12 * 3600000) return;
+  if (Date.now() - ratesTryAt < 10 * 60000) return;
+  ratesTryAt = Date.now();
   try {
     const r = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(5000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -419,8 +422,15 @@ app.get('/api/catalog/home', async (req, res) => {
   const max = catalogLimit(req.query.limit, 60, 80);
   sendCatalogHeaders(res);
   try {
-    await refreshRates();
-    const items = await homeItems(cat);
+    refreshRates().catch(() => {}); // les prix du catalogue sont en USD : on n'attend jamais les taux ici
+    // Si le catalogue n'est pas prêt après 20 s (réveil de Render, jeton CJ, limite de débit),
+    // on répond tout de suite « en préparation » : la construction continue en arrière-plan
+    // et le navigateur réessaie automatiquement.
+    const items = await Promise.race([homeItems(cat), sleep(20000).then(() => null)]);
+    if (!items) {
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(202).json({ ok: true, loading: true, currency: cur, items: [] });
+    }
     res.json({ ok: true, source: 'cj', currency: cur, items: present(items.slice(0, max), cur) });
   } catch (e) {
     console.error('catalog/home:', e.message);
@@ -436,7 +446,7 @@ app.get('/api/catalog/search', async (req, res) => {
   sendCatalogHeaders(res);
   if (!q) return res.json({ ok: true, source: 'cj', currency: cur, items: [], hasMore: false, page });
   try {
-    await refreshRates();
+    refreshRates().catch(() => {});
     // La recherche part chez CJ avec les mots saisis par le client et privilégie
     // les produits dont le prix fournisseur est compris entre 1 et 15 USD.
     // Si ce filtre ne donne rien (page 1), on relance sans plafond de prix.
@@ -524,7 +534,7 @@ app.get('/api/catalog/item', async (req, res) => {
   if (!id || !/^[\w-]+$/.test(id)) return res.status(400).json({ ok: false, error: 'Identifiant produit invalide' });
   sendCatalogHeaders(res);
   try {
-    await refreshRates();
+    refreshRates().catch(() => {});
     const loc = localCatalog(cur).find(x => x.id === id);
     if (loc) { const { usd, ...r } = loc; return res.json({ ok: true, ...r, img: r.image, item: r }); }
     const d = await cjDetail(id);
@@ -545,7 +555,7 @@ const keywords = name => String(name || '').toLowerCase().replace(/[^\p{L}\p{N} 
 app.get('/api/catalog/similar', async (req, res) => {
   const cur = curOf(req.query);
   try {
-    await refreshRates();
+    refreshRates().catch(() => {});
     const q = keywords(req.query.name) || String(req.query.q || '').slice(0, 60), id = String(req.query.itemId || '');
     if (!q) return res.json({ ok: true, items: [] });
     const items = rankCool((await cjItems(q, String(req.query.category || ''), 30, COOL)).filter(i => i.id !== id));
@@ -615,6 +625,24 @@ async function telegram(text) {
       body: JSON.stringify({ chat_id: E.TELEGRAM_CHAT_ID, text: String(text).slice(0, 4000) })
     });
   } catch (e) { console.error('Telegram:', e.message); }
+}
+
+/* ---------- EMAIL (optionnel) ----------
+   Le code d'origine appelait sendMail() sans la définir (ReferenceError dans les rappels et alertes).
+   Sans RESEND_API_KEY + MAIL_FROM, aucun email n'est envoyé et rien ne plante. */
+const MAIL_ON = !!(E.RESEND_API_KEY && E.MAIL_FROM);
+async function sendMail(to, subject, text, html) {
+  if (!MAIL_ON) return false;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${E.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: E.MAIL_FROM, to: [to], subject, text, ...(html ? { html } : {}) }),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!r.ok) console.error('mail HTTP', r.status);
+    return r.ok;
+  } catch (e) { console.error('mail:', e.message); return false; }
 }
 
 /* ---------- COMMANDES ---------- */
@@ -817,6 +845,7 @@ app.post('/api/track-view', limit('tv', 120, 3600000), (req, res) => {
   res.json({ ok: true });
 });
 async function runReminders() {
+  if (!MAIL_ON) return 0; // pas de service d'email configuré : on ne marque rien comme « rappelé »
   const delay = Number(E.REMINDER_DELAY_HOURS || 24) * 3600000, base = E.PUBLIC_BASE_URL || '';
   const v = rd('views.json', []), orders = rd('orders.json', []);
   let sent = 0;
@@ -891,7 +920,7 @@ app.get('/api/cj-debug', limit('cd', 10, 3600000), async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString(),
-  config: { cj: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN), camerpPay: !!E.CAMERPAY_TOKEN, camerpPayWebhook: !!E.CAMERPAY_CALLBACK_SECRET, telegram: !!E.TELEGRAM_BOT_TOKEN } }));
+  config: { cj: !!(E.CJ_API_KEY || E.CJ_ACCESS_TOKEN), camerpPay: !!E.CAMERPAY_TOKEN, camerpPayWebhook: !!E.CAMERPAY_CALLBACK_SECRET, telegram: !!E.TELEGRAM_BOT_TOKEN, mail: MAIL_ON } }));
 // Une route API inconnue doit rester une erreur JSON, jamais renvoyer index.html.
 app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Route API introuvable' }));
 
@@ -918,6 +947,7 @@ else app.listen(PORT, '0.0.0.0', () => {
   setTimeout(async () => {
     try { await homeItems('All'); } catch (e) { console.error('préchargement:', e.message); }
     if (E.CJ_PREWARM === '0') return;
+    await sleep(45000); // laisse passer les premiers visiteurs avant de lancer les autres catégories
     for (const cat of Object.keys(CAT_TERMS)) {
       while (cjPending > 0) await sleep(2000);
       try { await homeItems(cat); } catch (e) { console.error('préchargement', cat, e.message); }
