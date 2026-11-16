@@ -157,6 +157,7 @@ function cjGet(pathq) {
         const detail = [d.code, d.message, d.msg].filter(Boolean).join(' | ');
         cjLastError = `HTTP 429${detail ? ' — ' + detail : ''}`.slice(0, 300);
         console.error('CJ 429 DETAILS:', { code: d.code || null, message: d.message || d.msg || null, retryAfter: header || null, cooldownSeconds: Math.ceil(delay / 1000) });
+        if (attempt < 1) continue; // waitForCJSlot() attend la pause CJ, puis on réessaie une seule fois
         throw new Error(`CJ catalogue HTTP 429 (pause de ${Math.ceil(delay / 1000)} s)`);
       }
       if (response.status === 401 || response.status === 403) {
@@ -378,12 +379,17 @@ async function buildHome(cat) {
     // Essaie les mots-clés CJ concrets de cette catégorie jusqu'à obtenir des produits.
     // Les appels sont séquentiels : on évite de multiplier les requêtes simultanées.
     const terms = CAT_TERMS[cat] || [cat];
-    items = [];
+    const merged = new Map();
+    let lastErr = null;
     for (const term of terms) {
-      items = await cjItems(term, cat, 48, CATEGORY_SORT, 1, true);
-      if (items.length) break;
+      try {
+        const found = await cjItems(term, cat, 60, CATEGORY_SORT, 1, true); // sans plafond de prix, comme la recherche
+        for (const it of found) if (!merged.has(it.id)) merged.set(it.id, it);
+      } catch (e) { lastErr = e; console.error('catégorie', cat, term, e.message); }
+      if (merged.size >= 40) break;
     }
-    items = rankCool(items);
+    if (!merged.size && lastErr) throw lastErr;
+    items = rankCool([...merged.values()]);
   } else {
     // Accueil volontairement limité à un seul mot-clé CJ pour réduire les HTTP 429.
     const [c, q] = HOME_MIX[0];
@@ -447,16 +453,13 @@ app.get('/api/catalog/search', async (req, res) => {
   if (!q) return res.json({ ok: true, source: 'cj', currency: cur, items: [], hasMore: false, page });
   try {
     refreshRates().catch(() => {});
-    // La recherche part chez CJ avec les mots saisis par le client et privilégie
-    // les produits dont le prix fournisseur est compris entre 1 et 15 USD.
-    // Si ce filtre ne donne rien (page 1), on relance sans plafond de prix.
+    // La recherche part chez CJ avec les mots saisis par le client, tous prix confondus.
     // La marge cachée de 10 USD est ajoutée par MERCADO.
     const terms = searchTerms(q);
     const merged = new Map();
     let hasMore = false;
     for (const term of terms) {
-      let found = await cjItems(term, '', max, COOL, page, false);
-      if (!found.length && page === 1) found = await cjItems(term, '', max, SEARCH_SORT, page, true);
+      const found = await cjItems(term, '', max, SEARCH_SORT, page, true); // aucun plafond de prix
       if (found.length >= max) hasMore = true;
       for (const item of found) if (!merged.has(item.id)) merged.set(item.id, item);
       if (merged.size >= max) break;
@@ -558,7 +561,7 @@ app.get('/api/catalog/similar', async (req, res) => {
     refreshRates().catch(() => {});
     const q = keywords(req.query.name) || String(req.query.q || '').slice(0, 60), id = String(req.query.itemId || '');
     if (!q) return res.json({ ok: true, items: [] });
-    const items = rankCool((await cjItems(q, String(req.query.category || ''), 30, COOL)).filter(i => i.id !== id));
+    const items = rankCool((await cjItems(q, String(req.query.category || ''), 30, SEARCH_SORT, 1, true)).filter(i => i.id !== id));
     const max = catalogLimit(req.query.limit, 8, 12);
     res.json({ ok: true, currency: cur, items: present(await sharpOnly(items, max), cur) });
   } catch (e) { console.error('similar:', e.message); res.json({ ok: true, items: [] }); }
@@ -955,3 +958,4 @@ else app.listen(PORT, '0.0.0.0', () => {
     }
   }, 5000);
 });
+z
