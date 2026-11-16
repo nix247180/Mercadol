@@ -663,15 +663,17 @@ async function serverTotal(items) { // total USD marge incluse : le prix vient d
   let t = 0;
   for (const i of items || []) {
     const id = String(i.id);
-    if (i.requiresVariant && !i.variantId) return null;
-    let p;
+    let p = null;
     if (i.variantId) {
       p = await refreshPrice(id, i.variantId);
+      // Variante introuvable (CJ momentanément indisponible, identifiant différent) : on ne bloque pas
+      // l'achat, on retombe sur le prix de liste du produit.
+      if (p == null) p = priceCache.get(id) ?? await refreshPrice(id, '');
     } else {
-      // Si CJ indique plusieurs variantes, on exige que le client en choisisse une.
+      // Aucune variante précisée (ajout depuis la liste, chargement lent) : on ne bloque pas non plus.
+      // Prix = prix de liste (le plus bas) ; la commande indique la variante choisie, sinon le support la confirme.
       try {
         const detail = await cjDetail(id);
-        if (detail && (detail.variants || []).length > 1) return null;
         p = detail && detail.base > 0 ? withProfit(detail.base) : priceCache.get(id);
       } catch (_) { p = priceCache.get(id); }
       if (p == null) p = await refreshPrice(id, '');
@@ -958,4 +960,3 @@ else app.listen(PORT, '0.0.0.0', () => {
     }
   }, 5000);
 });
-z
