@@ -129,7 +129,7 @@ let cjCooldownUntil = 0;
 let cjLastError = '';
 let cjLastStatus = null;
 const cjFlights = new Map();
-const CJ_GAP_MS = Number(E.CJ_GAP_MS || 1500); // intervalle entre deux appels CJ
+const CJ_GAP_MS = Number(E.CJ_GAP_MS || 1100); // intervalle entre deux appels CJ
 let cjPending = 0; // nombre d'appels CJ en attente (sert à laisser la priorité aux clients)
 async function waitForCJSlot() {
   const wait = Math.max(0, cjNextAt - Date.now(), cjCooldownUntil - Date.now());
@@ -152,7 +152,7 @@ function cjGet(pathq) {
         const header = response.headers.get('retry-after');
         const retrySeconds = Number(header);
         const retryDate = header && !Number.isFinite(retrySeconds) ? Date.parse(header) - Date.now() : 0;
-        const delay = Math.max(15000, Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds * 1000 : 0, retryDate > 0 ? retryDate : 0);
+        const delay = Math.max(5000, Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds * 1000 : 0, retryDate > 0 ? retryDate : 0);
         cjCooldownUntil = Date.now() + delay;
         const detail = [d.code, d.message, d.msg].filter(Boolean).join(' | ');
         cjLastError = `HTTP 429${detail ? ' — ' + detail : ''}`.slice(0, 300);
@@ -259,11 +259,18 @@ function mapCJ(list, cat, allowAnyPrice = false) { // prix affiché = prix fourn
 const CACHE_FILE = F('cj-catalog-cache.json');
 const savedCJ = rd('cj-catalog-cache.json', { home: [], keywords: [] });
 const kwCache = new Map(Array.isArray(savedCJ.keywords) ? savedCJ.keywords : []); // cache CJ persistant
-function persistCJCache() {
-  try {
-    const payload = { home: [...homeCache.entries()], keywords: [...kwCache.entries()].slice(-250) };
-    const tmp = CACHE_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(payload)); fs.renameSync(tmp, CACHE_FILE);
-  } catch (e) { console.error('cache CJ disque:', e.message); }
+let persistTimer = null;
+function persistCJCache() { // différé : au plus une écriture toutes les 20 s, en arrière-plan
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      const payload = JSON.stringify({ home: [...homeCache.entries()], keywords: [...kwCache.entries()].slice(-60) });
+      const tmp = CACHE_FILE + '.tmp';
+      fs.writeFile(tmp, payload, err => { if (err) return console.error('cache CJ disque:', err.message); fs.rename(tmp, CACHE_FILE, () => {}); });
+    } catch (e) { console.error('cache CJ disque:', e.message); }
+  }, 20000);
+  persistTimer.unref();
 }
 async function cjItems(q, cat, size = 40, extra = '', page = 1, allowAnyPrice = false) {
   const k = q + '|' + size + '|' + extra + '|' + page + '|' + allowAnyPrice, hit = kwCache.get(k);
@@ -383,10 +390,10 @@ async function buildHome(cat) {
     let lastErr = null;
     for (const term of terms) {
       try {
-        const found = await cjItems(term, cat, 60, CATEGORY_SORT, 1, true); // sans plafond de prix, comme la recherche
+        const found = await cjItems(term, cat, 48, CATEGORY_SORT, 1, true); // sans plafond de prix, comme la recherche
         for (const it of found) if (!merged.has(it.id)) merged.set(it.id, it);
       } catch (e) { lastErr = e; console.error('catégorie', cat, term, e.message); }
-      if (merged.size >= 40) break;
+      if (merged.size >= 12) break; // assez pour afficher : un seul appel CJ dans le cas normal (rapide)
     }
     if (!merged.size && lastErr) throw lastErr;
     items = rankCool([...merged.values()]);
@@ -429,10 +436,10 @@ app.get('/api/catalog/home', async (req, res) => {
   sendCatalogHeaders(res);
   try {
     refreshRates().catch(() => {}); // les prix du catalogue sont en USD : on n'attend jamais les taux ici
-    // Si le catalogue n'est pas prêt après 20 s (réveil de Render, jeton CJ, limite de débit),
+    // Si le catalogue n'est pas prêt après 8 s (réveil de Render, jeton CJ, limite de débit),
     // on répond tout de suite « en préparation » : la construction continue en arrière-plan
     // et le navigateur réessaie automatiquement.
-    const items = await Promise.race([homeItems(cat), sleep(20000).then(() => null)]);
+    const items = await Promise.race([homeItems(cat), sleep(8000).then(() => null)]);
     if (!items) {
       res.setHeader('Cache-Control', 'no-store');
       return res.status(202).json({ ok: true, loading: true, currency: cur, items: [] });
@@ -972,6 +979,7 @@ else app.listen(PORT, '0.0.0.0', () => {
   console.log(`MERCADO port ${PORT} | marge ${PROFIT_USD} USD | CamerPay ${CAMERPAY_TOKEN ? 'configuré' : 'non configuré'}`);
   // Préchargement : accueil d'abord, puis les autres catégories une par une en arrière-plan.
   // Les requêtes des clients restent prioritaires (on attend que la file CJ soit libre).
+  cjToken(false).catch(() => {}); // jeton prêt avant la première visite
   setTimeout(async () => {
     try { await homeItems('All'); } catch (e) { console.error('préchargement:', e.message); }
     if (E.CJ_PREWARM === '0') return;
