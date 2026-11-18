@@ -751,24 +751,30 @@ app.post('/api/payment/camerpay', limit('camerpay', 20, 3600000), async (req, re
       merchant_callback_url: `${baseUrl(req)}/api/payment/camerpay/webhook`,
       merchant_return_url: `${baseUrl(req)}/?order=${encodeURIComponent(orderId)}#confirm`,
       source: 'mercado_checkout',
-      idempotency_key: `mercado-${orderId}`
+      idempotency_key: `mercado-${orderId}`,
+      ...(E.CAMERPAY_METHOD ? { payment_method: E.CAMERPAY_METHOD } : {}) // optionnel : orange_money, mtn_momo… (sinon le client choisit)
     };
     const r = await fetch(`${CAMERPAY_API}/payment/initiate`, {
       method: 'POST', headers: camerpPayHeaders(), body: JSON.stringify(body)
     });
     const d = await r.json().catch(() => ({}));
-    const paymentUrl = d.pay_url || d.redirect_url;
-    if (!r.ok || !d.success || !d.transaction_uuid || !paymentUrl) {
-      console.error('CamerPay initiate:', r.status, d);
+    const tx = d.transaction && typeof d.transaction === 'object' ? d.transaction : {};
+    const paymentUrl = d.pay_url || d.redirect_url || d.payment_url || tx.pay_url || tx.redirect_url || tx.payment_url;
+    const txUuid = d.transaction_uuid || d.uuid || tx.uuid || tx.transaction_uuid || '';
+    if (!r.ok || d.success === false || !paymentUrl) {
+      console.error('CamerPay initiate:', r.status, JSON.stringify(d).slice(0, 600));
+      // Message le plus précis possible : message CamerPay, première erreur de champ, ou action à faire (ex. KYC, HTTP 402).
+      const fieldErr = d.errors && typeof d.errors === 'object' ? Object.values(d.errors).flat()[0] : '';
+      const msg = [...new Set([d.message || d.error, fieldErr, d.next_action].filter(Boolean))].join(' — ')
+        || (r.status === 401 ? 'Jeton CamerPay invalide (vérifiez CAMERPAY_TOKEN dans Render).' : `CamerPay n’a pas pu créer le paiement (HTTP ${r.status}).`);
       return res.status(r.status >= 400 && r.status < 500 ? r.status : 502).json({
-        error: d.message || d.errors?.amount?.[0] || 'CamerPay n’a pas pu créer le paiement.',
-        code: d.failure_code || null
+        error: msg, code: d.failure_code || d.code || null, upgrade_url: d.upgrade_url || null
       });
     }
     const pays = rd('payments.json', {});
-    pays[orderId] = { provider: 'CamerPay', uuid: d.transaction_uuid, amount, usd, status: d.status || 'pending', at: Date.now(), paid: false };
+    pays[orderId] = { provider: 'CamerPay', uuid: txUuid, amount, usd, status: d.status || tx.status || 'pending', at: Date.now(), paid: false };
     wr('payments.json', pays);
-    res.json({ ok: true, payment_url: paymentUrl, orderId, amount, currency: 'XAF', transaction_uuid: d.transaction_uuid });
+    res.json({ ok: true, payment_url: paymentUrl, orderId, amount, currency: 'XAF', transaction_uuid: txUuid });
   } catch (e) {
     console.error('CamerPay initiate:', e.message);
     res.status(502).json({ error: 'Paiement CamerPay indisponible. Réessayez plus tard.' });
@@ -779,8 +785,9 @@ async function camerpPayStatus(uuid) {
   if (!CAMERPAY_TOKEN) throw new Error('CAMERPAY_TOKEN manquant');
   const r = await fetch(`${CAMERPAY_API}/payment/${encodeURIComponent(uuid)}/status`, { headers: { Authorization: `Bearer ${CAMERPAY_TOKEN}` } });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok || !d.success) throw new Error(d.message || 'Impossible de vérifier le paiement CamerPay');
-  return d;
+  if (!r.ok || d.success === false) throw new Error(d.message || 'Impossible de vérifier le paiement CamerPay');
+  const tx = d.transaction && typeof d.transaction === 'object' ? d.transaction : d;
+  return { status: tx.status ?? d.status, amount: tx.amount ?? d.amount, paid_at: tx.paid_at ?? d.paid_at };
 }
 async function settleCamerPay(orderId) {
   const pays = rd('payments.json', {}), p = pays[orderId];
@@ -813,6 +820,22 @@ app.post('/api/payment/camerpay/webhook', async (req, res) => {
     else if (['failed', 'cancelled', 'refunded'].includes(status)) { p.status = status; wr('payments.json', pays); }
     return res.status(200).send('OK');
   } catch (e) { console.error('CamerPay webhook:', e.message); return res.status(500).send('Webhook processing error'); }
+});
+
+// Diagnostic : ouvrez /api/camerpay-status dans le navigateur. Aucun secret affiché, aucun paiement créé.
+app.get('/api/camerpay-status', limit('cps', 10, 3600000), async (req, res) => {
+  const out = { jetonConfigure: !!CAMERPAY_TOKEN, secretWebhookConfigure: !!CAMERPAY_CALLBACK_SECRET,
+    urlSite: E.PUBLIC_BASE_URL || baseUrl(req) + ' (PUBLIC_BASE_URL non défini : adresse déduite)', methodeImposee: E.CAMERPAY_METHOD || 'aucune (le client choisit)' };
+  if (!CAMERPAY_TOKEN) { out.verdict = 'CAMERPAY_TOKEN absent dans Render.'; return res.json(out); }
+  try {
+    const r = await fetch(`${CAMERPAY_API}/payment/00000000-0000-0000-0000-000000000000/status`,
+      { headers: { Authorization: `Bearer ${CAMERPAY_TOKEN}` }, signal: AbortSignal.timeout(10000) });
+    out.reponseCamerPay = `HTTP ${r.status}`;
+    out.verdict = r.status === 401 || r.status === 403 ? 'Jeton REFUSÉ par CamerPay : mauvais jeton, révoqué, ou jeton de démo.'
+      : r.status === 404 || r.status === 422 ? 'Jeton ACCEPTÉ par CamerPay (le paiement test inexistant renvoie bien une erreur normale).'
+      : r.status >= 500 ? 'CamerPay a une panne ou une erreur de son côté, réessayez plus tard.' : 'Réponse inattendue, voir reponseCamerPay.';
+  } catch (e) { out.verdict = 'CamerPay injoignable depuis le serveur : ' + String(e.message).slice(0, 120); }
+  res.json(out);
 });
 
 app.get('/api/order/status', limit('os', 90, 3600000), async (req, res) => {
